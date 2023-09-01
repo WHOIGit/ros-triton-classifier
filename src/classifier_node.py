@@ -27,12 +27,11 @@ def on_image(model, class_pub, image_msg):
         result = model.infer(pil_image)
     except Exception as e:
         rospy.logerr('Error getting classification from Triton: %s', e)
-        return
+        raise e
 
     # Null-check response
     if len(result.output) != 1 or len(result.output[0]) < 1:
-        rospy.logerr('Unexpected result from classifier: %s', repr(result))
-        return
+        raise ValueError('Unexpected result from classifier', repr(result))
 
     # Format message and publish
     classification = Classification()
