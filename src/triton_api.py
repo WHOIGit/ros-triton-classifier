@@ -397,7 +397,9 @@ class Model:
                 if result.shape[0] > self.max_batch_size:
                     raise ValueError('Too many inputs in batch')
             else:
-                assert result.shape == inputobj.metadata.shape
+                assert result.shape[0] == inputobj.metadata.shape[0]
+                assert result.shape[1] == inputobj.metadata.shape[1]
+                assert result.shape[2] == inputobj.metadata.shape[2]
 
             # Create the InferInput object for this input
             req_inputs.append(tritonclient.grpc.InferInput(
@@ -485,11 +487,16 @@ def main():
     # Request inference
     # TODO: We should batch these according to the models max_batch_size
     start = time.perf_counter()
-    result = model.infer(images)
+    if len(images) > 1 and args.batch_size == 1:
+        for image in images:
+            result = model.infer(image)
+            pprint.pprint(result.output)
+    else: 
+        result = model.infer(images)
+        pprint.pprint(result.output)
     stop = time.perf_counter()
 
     # Display the output
-    pprint.pprint(result.output)
     print(
         f'Processed {len(images)} images in {(stop - start):0.3f} seconds '
         f'({(stop - start)/len(images):0.3f} sec per image)'

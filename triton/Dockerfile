@@ -1,7 +1,22 @@
-# Originally https://gist.github.com/rgov/874e1d72f25dee457c20e38982743d9b
-# NOTE:
-# There are also base images l4t-ml, l4t-pytorch, etc. that might be better to
-# use.
+# NVIDIA does not publish a Triton container image for Jetson devices.
+# https://github.com/triton-inference-server/server/issues/4781
+#
+# This unofficial container image unpacks the Triton for Jetson tarball onto a 
+# L4T base image along with dependencies documented here:
+# https://github.com/triton-inference-server/server/blob/main/docs/user_guide/jetson.md
+#
+# Example usage:
+#
+#   docker build -t tritonserver:22.02-pyt-python-py3 -f Dockerfile.jetson .
+#   docker run --rm --name triton --runtime nvidia \
+#     --volume /usr/local/share/triton/models:/models \
+#     --publish 8000:8000/tcp \
+#     --publish 8001:8001/tcp \
+#     --publish 8002:8002/tcp \
+#     tritonserver:22.02-pyt-python-py3 \
+#     tritonserver --model-repository /models
+#
+# There are other base images (l4t-ml, l4t-pytorch, etc.) that might be better.
 
 FROM nvcr.io/nvidia/l4t-base:r32.7.1
 

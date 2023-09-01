@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-    <name>triton_image_classifier</name>
+    <name>triton_classifier</name>
     <version>1.0.0</version>
     <description>Triton Inference Client for Image Classification</description>
     <license>MIT</license>
