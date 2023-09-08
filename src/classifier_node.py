@@ -30,15 +30,15 @@ def on_image(model, class_pub, image_msg):
         raise e
 
     # Null-check response
-    if len(result.output) != 1 or len(result.output[0]) < 1:
-        raise ValueError('Unexpected result from classifier', repr(result))
+    if len(result.output) < 1:
+       raise ValueError('Unexpected result from classifier', repr(result))
 
     # Format message and publish
     classification = Classification()
     classification.header = image_msg.header
     classification.results = []
 
-    for r in result.output[0]:
+    for r in result.output:
         h = ObjectHypothesisWithClassName()
         h.class_name = r.class_name
         h.score = r.score
