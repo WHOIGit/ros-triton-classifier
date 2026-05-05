@@ -54,16 +54,19 @@ def main():
     model.input = ImageInput(scaling=ScalingMode.INCEPTION)
     model.output = ClassificationOutput(classes=3)
 
-    # Advertise that we will publish a "/class" subtopic of the image topic
+    image_topic = rospy.get_param('~image_topic')
+    classification_topic = rospy.get_param('~classification_topic', image_topic + '/class')
+
+    # Advertise the classification result topic
     class_pub = rospy.Publisher(
-        rospy.get_param('~image_topic') + '/class',
+        classification_topic,
         Classification,
         queue_size=1
     )
 
     # Subscribe to the raw image data
     rospy.Subscriber(
-        rospy.get_param('~image_topic') + '/raw',
+        image_topic + '/raw',
         Image,
         functools.partial(on_image, model, class_pub)
     )
