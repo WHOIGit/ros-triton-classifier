@@ -25,6 +25,19 @@ from PIL import Image
 from tritonclient.grpc import model_config_pb2, service_pb2
 
 
+def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    '''
+    Convert a *complete* vector of logits into probabilities.
+
+    Triton does not apply an activation function to model outputs. Apply this to
+    the full output tensor (bind the output as a TensorOutput); applying it to
+    the truncated top-N scores from ClassificationOutput gives wrong answers.
+    '''
+    shifted = logits - np.max(logits, axis=axis, keepdims=True)
+    exp = np.exp(shifted)
+    return exp / np.sum(exp, axis=axis, keepdims=True)
+
+
 def model_dtype_to_np(model_dtype: str) -> object:
     return {
         'BOOL':   bool,
@@ -299,6 +312,18 @@ class TensorOutput(ModelOutput):
 
 
 class ClassificationOutput(ModelOutput):
+    '''
+    Parses Triton's built-in classification post-processing (`class_count`),
+    which returns only the top-N entries as score:class_id:class_name strings.
+
+    NOTE: because the server truncates to the N classes requested, the scores
+    this returns are an arbitrary subset of the model's logits. A softmax over
+    them normalizes against that subset, not the full class set, and so reports
+    confidences that are too high (see issue #5). To obtain real probabilities,
+    bind the output as a TensorOutput to get the complete logit vector and call
+    softmax() on it client-side.
+    '''
+
     def __init__(self, classes: int = 1):
         super().__init__()
         if classes < 1:
