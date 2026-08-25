@@ -5,16 +5,19 @@
     {
       "class_count": 0,
       "fill": 0.0,
+      "image": null,
       "name": "zeros"
     },
     {
       "class_count": 0,
       "fill": null,
+      "image": null,
       "name": "gradient"
     },
     {
       "class_count": 3,
       "fill": null,
+      "image": null,
       "name": "gradient_top3"
     }
   ],

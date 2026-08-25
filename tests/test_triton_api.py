@@ -23,6 +23,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import triton_api  # noqa: E402
 from fake_triton import FakeInferenceServerClient  # noqa: E402
 
+BUS_JPG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       'assets', 'bus.jpg')
+
+# The first handful of COCO classes, enough to name what is in bus.jpg.
+COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+    'truck', 'boat', 'traffic light',
+]
+
 
 def make_model(fixture, response=None):
     client = FakeInferenceServerClient(fixture, response=response)
@@ -292,6 +301,38 @@ def test_detection_output_decodes_a_real_yolo_head():
     # Ranked best-first
     scores = [d.score for d in detections]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_detection_finds_the_real_objects_in_bus_jpg():
+    '''
+    The 'bus' fixture is yolov8n's response to the stock Ultralytics test photo,
+    which contains a bus and several people. Assert on the actual objects, not
+    just tensor shapes -- this is what catches a decode that is subtly wrong.
+    '''
+    model, _ = make_model('yolov8n', response='bus')
+    model.images = triton_api.ImageInput(
+        scaling=triton_api.ScalingMode.NORM, layout='NCHW', letterbox=True)
+    model.output0 = triton_api.DetectionOutput(confidence=0.25, labels=COCO_CLASSES)
+
+    detections = model.infer(Image.open(BUS_JPG)).output0
+    found = {d.class_name for d in detections}
+
+    assert 'bus' in found, f'expected a bus, got {found}'
+    assert 'person' in found, f'expected people, got {found}'
+    assert len([d for d in detections if d.class_name == 'person']) >= 3
+
+    # The bus is the big object: it should cover a good fraction of the frame.
+    bus = next(d for d in detections if d.class_name == 'bus')
+    assert bus.score > 0.7
+    assert (bus.x2 - bus.x1) > 300 and (bus.y2 - bus.y1) > 200
+
+    # bus.jpg is portrait (810x1080) letterboxed into a square, so every box
+    # must fall inside the un-padded content band, not in the grey padding.
+    scale = min(640 / 810, 640 / 1080)
+    pad_x = (640 - 810 * scale) / 2
+    for d in detections:
+        assert d.x1 >= pad_x - 1, f'{d.class_name} starts in the padding'
+        assert d.x2 <= 640 - pad_x + 1, f'{d.class_name} ends in the padding'
 
 
 def test_detection_confidence_threshold_filters():
