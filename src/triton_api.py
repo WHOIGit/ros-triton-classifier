@@ -80,6 +80,20 @@ class Classification(NamedTuple):
     class_name: str
 
 
+class Detection(NamedTuple):
+    '''
+    A single detected object: its class, confidence, and bounding box in
+    corner form, in pixels relative to the model's input size.
+    '''
+    score: float
+    class_id: int
+    class_name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
 class InferenceResult:
     '''
     Holds the results of an inference call.
@@ -379,6 +393,122 @@ class ClassificationOutput(ModelOutput):
             return [self._parse_classification(b) for b in value]
         else:
             raise ValueError('Expected only 1 or 2 dimensions')
+
+
+class DetectionOutput(ModelOutput):
+    '''
+    Decodes the raw output of a YOLO-style detection head into Detection
+    objects: it splits boxes from class scores, drops low-confidence anchors,
+    and applies per-class non-maximum suppression.
+
+    Expects a tensor shaped (4 + num_classes, num_anchors) -- optionally with a
+    leading batch axis -- where the first four rows are the box center x, center
+    y, width, and height in input-image pixels, as exported by Ultralytics
+    YOLOv8/v11. Box coordinates are relative to the model's input size; if the
+    image was letterboxed, map them back yourself using the same scale/padding.
+    '''
+
+    def __init__(self, confidence: float = 0.25, iou: float = 0.45,
+                 labels: List[str] = None):  # type: ignore[assignment]
+        super().__init__()
+        self.confidence = confidence
+        self.iou = iou
+        self.labels = labels
+
+    def _class_name(self, class_id: int) -> str:
+        if self.labels is not None and 0 <= class_id < len(self.labels):
+            return self.labels[class_id]
+        return str(class_id)
+
+    @staticmethod
+    def _nms(boxes: np.ndarray, scores: np.ndarray, iou: float) -> List[int]:
+        '''Greedy non-maximum suppression over xyxy boxes; returns kept indices.'''
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+        order = np.argsort(scores)[::-1]
+
+        keep = []
+        while order.size > 0:
+            best = order[0]
+            keep.append(int(best))
+            if order.size == 1:
+                break
+            rest = order[1:]
+
+            # Intersection of the best box with every remaining box
+            ix1 = np.maximum(x1[best], x1[rest])
+            iy1 = np.maximum(y1[best], y1[rest])
+            ix2 = np.minimum(x2[best], x2[rest])
+            iy2 = np.minimum(y2[best], y2[rest])
+            overlap = (np.clip(ix2 - ix1, 0, None) *
+                       np.clip(iy2 - iy1, 0, None))
+
+            union = areas[best] + areas[rest] - overlap
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = np.where(union > 0, overlap / union, 0)
+            order = rest[ratio <= iou]
+
+        return keep
+
+    def _process_one(self, predictions: np.ndarray) -> List[Detection]:
+        # Accept either (4+nc, anchors) or its transpose, since exporters
+        # disagree; anchors always vastly outnumber the 4+nc rows.
+        if predictions.shape[0] > predictions.shape[1]:
+            predictions = predictions.T
+        boxes, scores = predictions[:4].T, predictions[4:].T
+
+        class_ids = np.argmax(scores, axis=1)
+        confidences = scores[np.arange(scores.shape[0]), class_ids]
+
+        selected = confidences >= self.confidence
+        boxes = boxes[selected]
+        class_ids = class_ids[selected]
+        confidences = confidences[selected]
+
+        # Convert center-form xywh to corner-form xyxy for NMS, and clip to the
+        # input bounds -- the head can predict boxes that run off the edge.
+        centers, sizes = boxes[:, :2], boxes[:, 2:4]
+        corners = np.concatenate([centers - sizes / 2, centers + sizes / 2],
+                                 axis=1)
+        image_input = getattr(self.model, self.model.metadata.inputs[0].name)
+        width = getattr(image_input, 'width', 0)
+        height = getattr(image_input, 'height', 0)
+        if width > 0 and height > 0:
+            corners[:, [0, 2]] = corners[:, [0, 2]].clip(0, width)
+            corners[:, [1, 3]] = corners[:, [1, 3]].clip(0, height)
+
+        detections = []
+        for class_id in np.unique(class_ids):
+            members = np.nonzero(class_ids == class_id)[0]
+            for index in self._nms(corners[members], confidences[members],
+                                   self.iou):
+                which = members[index]
+                x1, y1, x2, y2 = corners[which]
+                detections.append(Detection(
+                    score=float(confidences[which]),
+                    class_id=int(class_id),
+                    class_name=self._class_name(int(class_id)),
+                    x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+                ))
+
+        detections.sort(key=lambda d: d.score, reverse=True)
+        return detections
+
+    def process(self, value: np.ndarray) \
+            -> Union[List[List[Detection]], List[Detection]]:
+
+        # Only a batching model's leading axis is a batch; for a non-batching
+        # model a leading 1 belongs to the model's own output shape.
+        if self.model.can_batch:
+            if value.ndim != 3:
+                raise ValueError('Expected 3 dimensions for a batched output')
+            return [self._process_one(a) for a in value]
+
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        if value.ndim != 2:
+            raise ValueError('Expected a 2-dimensional detection output')
+        return self._process_one(value)
 
 
 class Model:
