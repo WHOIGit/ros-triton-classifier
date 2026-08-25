@@ -333,9 +333,19 @@ class ClassificationOutput(ModelOutput):
     def _parse_classification(self, c: bytes) -> Classification:
         '''
         Parse the score:class_id:class_name format that we receive from Triton
-        into a Classification object. 
+        into a Classification object.
+
+        The trailing name is only present when the model config names a
+        label_filename; without one Triton sends just score:class_id.
         '''
-        score, class_id, class_name = c.decode().split(':', maxsplit=2)
+        fields = c.decode().split(':', maxsplit=2)
+        if len(fields) == 2:
+            (score, class_id), class_name = fields, ''
+        elif len(fields) == 3:
+            score, class_id, class_name = fields
+        else:
+            raise ValueError(f'Malformed classification from Triton: {c!r}')
+
         return Classification(
             score=float(score),
             class_id=int(class_id),
