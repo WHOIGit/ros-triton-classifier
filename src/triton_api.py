@@ -698,17 +698,31 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('-m', '--model-name', required=True)
     parser.add_argument('-x', '--model-version', default='')
-    parser.add_argument('-c', '--classes', type=int, default=3,
-                        help='classes to request (classification mode)')
+    parser.add_argument('-b', '--batch-size', type=int, default=1,
+                        help='images to submit per inference request; the '
+                             "model's max_batch_size is the upper limit")
+    # VGG is deliberately absent: ScalingMode.VGG has no implementation, and
+    # offering it here only defers the failure to inference time.
     parser.add_argument('-t', '--image-transform',
-                        choices=['NONE', 'NORM', 'INCEPTION', 'VGG'],
+                        choices=['NONE', 'NORM', 'INCEPTION'],
                         default='NONE')
     parser.add_argument('-l', '--layout', choices=['NCHW', 'NHWC'], default=None,
                         help="channel layout when the model config omits `format`")
-    parser.add_argument('--raw', action='store_true',
-                        help='return the raw output tensor instead of parsing '
-                             'classifications (e.g. for detection models)')
+    parser.add_argument('--letterbox', action='store_true',
+                        help='preserve aspect ratio by padding instead of '
+                             'stretching (detection models expect this)')
     parser.add_argument('-u', '--url', default='localhost:8001')
+
+    # How to interpret the output tensor. These are mutually exclusive so that
+    # e.g. `-c 5 --raw` is rejected rather than silently ignoring -c.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('-c', '--classes', type=int, default=None,
+                      help='parse the top N classifications (the default, N=3)')
+    mode.add_argument('--detect', action='store_true',
+                      help='decode YOLO-style detections (boxes + NMS)')
+    mode.add_argument('--raw', action='store_true',
+                      help='return the raw output tensor without parsing')
+
     parser.add_argument('images', nargs='+')
     args = parser.parse_args()
 
@@ -721,17 +735,31 @@ def main():
     out_name = model.metadata.outputs[0].name
 
     setattr(model, in_name, ImageInput(
-        scaling=ScalingMode[args.image_transform], layout=args.layout))
+        scaling=ScalingMode[args.image_transform], layout=args.layout,
+        letterbox=args.letterbox))
     if args.raw:
         setattr(model, out_name, TensorOutput())
+    elif args.detect:
+        setattr(model, out_name, DetectionOutput())
     else:
-        setattr(model, out_name, ClassificationOutput(classes=args.classes))
+        setattr(model, out_name, ClassificationOutput(
+            classes=args.classes if args.classes is not None else 3))
 
     images = [Image.open(path) for path in args.images]
 
+    # Submit in batches so a batch-capable model can amortize the round trip.
+    batch_size = max(1, args.batch_size)
+    if batch_size > 1 and not model.can_batch:
+        parser.error(f'model {model.name} does not accept batched input')
+    if model.can_batch:
+        batch_size = min(batch_size, model.max_batch_size)
+
     start = time.perf_counter()
-    for image in images:
-        result = model.infer(image)
+    for offset in range(0, len(images), batch_size):
+        batch = images[offset:offset + batch_size]
+
+        # A batching model always wants a list, even a single-element one.
+        result = model.infer(batch if model.can_batch else batch[0])
         value = getattr(result, out_name)
         if args.raw:
             arr = np.asarray(value)
