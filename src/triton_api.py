@@ -128,7 +128,8 @@ class TensorInput(ModelInput):
 
 class ImageInput(ModelInput):
     def __init__(self, scaling: ScalingMode = ScalingMode.NONE,
-                 layout: str = None):  # type: ignore[assignment]
+                 layout: str = None,  # type: ignore[assignment]
+                 size: tuple = None):  # type: ignore[assignment]
         super().__init__()
         self.scaling = scaling
         # Channel layout, 'NCHW' or 'NHWC'. If None it is taken from the model
@@ -136,6 +137,9 @@ class ImageInput(ModelInput):
         # does not declare a format (common for ONNX detectors, where `format`
         # cannot be set because the input tensor keeps an explicit batch dim).
         self.layout = layout
+        # Explicit (width, height) for models that declare dynamic spatial
+        # dimensions, where the shape metadata alone cannot tell us the size.
+        self.size = size
         self.channels = self.width = self.height = 0
         self._rank = 0  # rank of the model's input tensor (3 or 4)
 
@@ -171,6 +175,19 @@ class ImageInput(ModelInput):
             self.channels, self.height, self.width = shape[-3], shape[-2], shape[-1]
         else:  # NHWC
             self.height, self.width, self.channels = shape[-3], shape[-2], shape[-1]
+
+        # Triton reports -1 for any dimension the model leaves dynamic, which is
+        # not a usable image size. Fall back to an explicit size= if given.
+        if self.size is not None:
+            self.width, self.height = self.size
+        if self.width < 1 or self.height < 1:
+            raise ValueError(
+                f'Model declares dynamic spatial dimensions {shape}; pass '
+                'size=(width, height) to ImageInput() to choose the input size')
+        if self.channels < 1:
+            raise ValueError(
+                f'Model declares a dynamic channel count in {shape}; '
+                'ImageInput needs a fixed 1- or 3-channel input')
 
     def _process_one(self, image: Image.Image) -> np.ndarray:
         # Convert the image to the model's expected channel count
@@ -420,9 +437,14 @@ class Model:
                 if result.shape[0] > self.max_batch_size:
                     raise ValueError('Too many inputs in batch')
             else:
-                assert list(result.shape) == list(inputobj.metadata.shape), \
-                    (f'processed input shape {list(result.shape)} does not '
-                     f'match model shape {list(inputobj.metadata.shape)}')
+                # -1 marks a dimension the model leaves dynamic, which any
+                # size satisfies.
+                actual, expected = \
+                    list(result.shape), list(inputobj.metadata.shape)
+                assert len(actual) == len(expected) and \
+                    all(e == -1 or a == e for a, e in zip(actual, expected)), \
+                    (f'processed input shape {actual} does not '
+                     f'match model shape {expected}')
 
             # Create the InferInput object for this input
             req_inputs.append(tritonclient.grpc.InferInput(
