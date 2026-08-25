@@ -202,9 +202,16 @@ class ImageInput(ModelInput):
         # https://medium.com/neuronio/how-to-deal-with-image-resizing-in-deep-learning-e5177fad7d89
         image = image.resize((self.width, self.height), Image.BILINEAR)
 
-        # Convert the image to a nparray
-        array = np.array(image).astype(
-            model_dtype_to_np(self.metadata.datatype))
+        # Convert the image to a nparray. Scaling produces fractional values, so
+        # it is only meaningful for a float input tensor; catch an integer one
+        # here rather than letting numpy raise an opaque casting error below.
+        dtype = np.dtype(model_dtype_to_np(self.metadata.datatype))
+        if self.scaling != ScalingMode.NONE and not np.issubdtype(dtype,
+                                                                  np.floating):
+            raise ValueError(
+                f'{self.scaling.name} scaling requires a floating-point input '
+                f'tensor, but the model expects {self.metadata.datatype}')
+        array = np.array(image).astype(dtype)
 
         # If the image is grayscale, add a channel axis (HW -> HWC)
         if array.ndim == 2:
