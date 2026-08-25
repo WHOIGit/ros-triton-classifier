@@ -374,6 +374,16 @@ class ModelOutput:
         except StopIteration as exc:
             raise ValueError(f'No model output named "{name}"') from exc
 
+    @property
+    def class_count(self) -> int:
+        '''
+        How many classes to ask Triton to pick out server-side.
+
+        0 (the default) means "return the output tensor as-is". Only
+        ClassificationOutput overrides this.
+        '''
+        return 0
+
     def process(self, value: np.ndarray) -> Any:
         '''
         Process the "raw" ndarray output from the inference result and
@@ -391,22 +401,78 @@ class TensorOutput(ModelOutput):
 
 class ClassificationOutput(ModelOutput):
     '''
-    Parses Triton's built-in classification post-processing (`class_count`),
-    which returns only the top-N entries as score:class_id:class_name strings.
+    Returns the top `classes` results of a classification model.
 
-    NOTE: because the server truncates to the N classes requested, the scores
-    this returns are an arbitrary subset of the model's logits. A softmax over
-    them normalizes against that subset, not the full class set, and so reports
-    confidences that are too high (see issue #5). To obtain real probabilities,
-    bind the output as a TensorOutput to get the complete logit vector and call
-    softmax() on it client-side.
+    There are two ways to get them, and the choice is forced by a quirk of the
+    protocol. Triton applies no activation function to model outputs, so the
+    values a model emits are raw logits. Its built-in `class_count`
+    post-processing picks the top N server-side and sends them back as
+    score:class_id:class_name strings -- but by then the other logits are gone,
+    and a softmax over what survives normalizes against an arbitrary subset,
+    reporting confidences that are far too high (issue #5).
+
+    So `activation` decides both questions at once:
+
+      None (default)  ask the server for the top N. Cheap, and the class names
+                      come from the model's label_filename if it has one, but
+                      `score` is a raw logit, not a probability.
+
+      'softmax'       fetch the complete logit vector, normalize it locally
+                      over every class, then take the top N. `score` is then a
+                      real probability in [0, 1] that sums to 1 across all
+                      classes. Use this for single-label classifiers.
+
+      'sigmoid'       as above but squash each logit independently, for
+                      multi-label models where classes are not exclusive.
+
+    Fetching the full vector costs almost nothing -- a few kilobytes against
+    the image you just uploaded -- so prefer an activation unless you have a
+    reason not to. Class names are not sent in that mode; pass `labels` to name
+    them locally.
     '''
 
-    def __init__(self, classes: int = 1):
+    ACTIVATIONS = (None, 'softmax', 'sigmoid')
+
+    def __init__(self, classes: int = 1, activation: str = None,  # type: ignore[assignment]
+                 labels: List[str] = None):  # type: ignore[assignment]
         super().__init__()
         if classes < 1:
             raise ValueError('Must request at least one class')
+        if activation not in self.ACTIVATIONS:
+            raise ValueError(
+                f'activation must be one of {self.ACTIVATIONS}, got {activation!r}')
         self.classes = classes
+        self.activation = activation
+        self.labels = labels
+
+    @property
+    def class_count(self) -> int:
+        # Only let the server truncate when we are not normalizing locally: an
+        # activation is only correct over the complete set of logits.
+        return 0 if self.activation else self.classes
+
+    def _class_name(self, class_id: int) -> str:
+        if self.labels is not None and 0 <= class_id < len(self.labels):
+            return self.labels[class_id]
+        return ''
+
+    def _activate(self, logits: np.ndarray) -> np.ndarray:
+        if self.activation == 'softmax':
+            return softmax(logits, axis=-1)
+        # sigmoid, computed in a form that does not overflow for large |x|
+        return np.where(logits >= 0,
+                        1.0 / (1.0 + np.exp(-np.abs(logits))),
+                        np.exp(-np.abs(logits)) / (1.0 + np.exp(-np.abs(logits))))
+
+    def _top_classes(self, logits: np.ndarray) -> List[Classification]:
+        '''Normalize a full logit vector, then take the top `classes` of it.'''
+        scores = self._activate(np.asarray(logits, dtype=np.float64))
+        ranking = np.argsort(scores)[::-1][:self.classes]
+        return [
+            Classification(score=float(scores[i]), class_id=int(i),
+                           class_name=self._class_name(int(i)))
+            for i in ranking
+        ]
 
     def _parse_classification(self, c: bytes) -> Classification:
         '''
@@ -433,6 +499,22 @@ class ClassificationOutput(ModelOutput):
     def process(self, value: np.ndarray) \
             -> Union[List[List[Classification]], List[Classification]]:
 
+        if self.activation:
+            # A full logit vector per input, so rank locally.
+            if self.model.can_batch:
+                if value.ndim != 2:
+                    raise ValueError(
+                        'Expected 2 dimensions for a batched output')
+                return [self._top_classes(row) for row in value]
+
+            # A leading 1 here belongs to the model's own output shape.
+            if value.ndim == 2 and value.shape[0] == 1:
+                value = value[0]
+            if value.ndim != 1:
+                raise ValueError('Expected a 1-dimensional logit vector')
+            return self._top_classes(value)
+
+        # Triton already picked the top N and encoded them as strings.
         if value.ndim == 2:  # batched
             return [
                 [self._parse_classification(b) for b in a]
@@ -701,7 +783,7 @@ class Model:
 
             req_outputs.append(tritonclient.grpc.InferRequestedOutput(
                 name=outputobj.name,
-                class_count=getattr(outputobj, 'classes', 0)  # hacky
+                class_count=outputobj.class_count,
             ))
 
         # Submit the request to the inference server!

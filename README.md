@@ -48,8 +48,13 @@ optional; without them the node publishes numeric ids and logs a warning.
 ### Other parameters
 
 `~triton_server_url`, `~classifier_model`, `~layout` (`NCHW`/`NHWC`, needed when
-the model config declares no `format`), `~classes` (classification),
-`~confidence_threshold` and `~iou_threshold` (detection).
+the model config declares no `format`), `~classes` and `~activation`
+(classification), `~confidence_threshold` and `~iou_threshold` (detection).
+
+`~activation` defaults to `softmax`, which normalizes the model's complete
+logit vector locally so `score` is a probability in [0, 1] as vision_msgs
+expects. Use `sigmoid` for multi-label models, or `''` to publish the server's
+raw logits instead.
 
 
 ## Installation

@@ -305,6 +305,86 @@ def test_classification_handles_a_model_without_labels():
         output._parse_classification(b'nonsense')
 
 
+def test_softmax_activation_does_not_let_the_server_truncate():
+    '''The whole point: an activation needs every logit, so class_count is 0.'''
+    model, client = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=3, activation='softmax')
+
+    model.infer(Image.new('L', (28, 28)))
+
+    requested = client.last_request.outputs[0]._output
+    assert requested.parameters['classification'].int64_param == 0
+
+
+def test_softmax_activation_yields_real_probabilities():
+    model, _ = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    # Ask for all ten so we can check they form a distribution.
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=10, activation='softmax')
+
+    results = model.infer(Image.new('L', (28, 28))).Plus214_Output_0
+
+    assert len(results) == 10
+    scores = [c.score for c in results]
+    assert all(0.0 <= s <= 1.0 for s in scores)
+    assert sum(scores) == pytest.approx(1.0)       # over the FULL class set
+    assert scores == sorted(scores, reverse=True)  # ranked best-first
+    assert len({c.class_id for c in results}) == 10
+
+
+def test_truncated_softmax_would_have_been_wrong():
+    '''
+    Demonstrates issue #5. Normalizing the server's top-3 overstates every
+    confidence, because the other seven logits are missing from the sum.
+    '''
+    model, _ = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=10, activation='softmax')
+    correct = model.infer(Image.new('L', (28, 28))).Plus214_Output_0
+
+    # What you would get by softmaxing only the top 3 scores.
+    top3_logits = np.array([c.score for c in correct[:3]])
+    naive = triton_api.softmax(np.log(top3_logits))   # renormalize the subset
+
+    assert naive[0] > correct[0].score               # inflated
+    assert sum(naive) == pytest.approx(1.0)          # sums to 1 over a subset
+    assert sum(c.score for c in correct[:3]) < 1.0   # honest: leaves room
+
+
+def test_sigmoid_activation_is_independent_per_class():
+    model, _ = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=10, activation='sigmoid')
+
+    results = model.infer(Image.new('L', (28, 28))).Plus214_Output_0
+    scores = [c.score for c in results]
+    assert all(0.0 <= s <= 1.0 for s in scores)
+    # multi-label: no requirement to sum to 1
+    assert sum(scores) != pytest.approx(1.0)
+
+
+def test_activation_labels_name_the_classes():
+    digits = [f'digit-{i}' for i in range(10)]
+    model, _ = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=2, activation='softmax', labels=digits)
+
+    results = model.infer(Image.new('L', (28, 28))).Plus214_Output_0
+    for c in results:
+        assert c.class_name == f'digit-{c.class_id}'
+
+
+def test_rejects_an_unknown_activation():
+    with pytest.raises(ValueError, match='activation must be one of'):
+        triton_api.ClassificationOutput(classes=3, activation='relu')
+
+
 def test_softmax_normalizes_full_logits():
     model, _ = make_model('mnist', response='gradient')
     model.Input3 = triton_api.ImageInput(layout='NCHW')
