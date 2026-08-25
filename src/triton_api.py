@@ -266,6 +266,45 @@ class ImageInput(ModelInput):
 
         return array
 
+    def source_mapping(self, source_size: tuple) -> tuple:
+        '''
+        Describe how a source image of ``source_size`` = (width, height) is
+        placed into the model's input frame.
+
+        Returns ``(scale_x, scale_y, pad_x, pad_y)`` such that
+
+            input_x = source_x * scale_x + pad_x
+            input_y = source_y * scale_y + pad_y
+
+        Detection coordinates come back in the model's input frame, so this is
+        what you need to put them back on the original image.
+        '''
+        source_width, source_height = source_size
+        if not self.letterbox:
+            return (self.width / source_width, self.height / source_height,
+                    0.0, 0.0)
+
+        scale = min(self.width / source_width, self.height / source_height)
+        new_width = max(1, round(source_width * scale))
+        new_height = max(1, round(source_height * scale))
+        return (scale, scale,
+                (self.width - new_width) // 2, (self.height - new_height) // 2)
+
+    def to_source_box(self, box: tuple, source_size: tuple) -> tuple:
+        '''
+        Map an (x1, y1, x2, y2) box from the model's input frame back onto a
+        source image of ``source_size``, clipped to that image.
+        '''
+        scale_x, scale_y, pad_x, pad_y = self.source_mapping(source_size)
+        x1, y1, x2, y2 = box
+        source_width, source_height = source_size
+        return (
+            min(max((x1 - pad_x) / scale_x, 0.0), source_width),
+            min(max((y1 - pad_y) / scale_y, 0.0), source_height),
+            min(max((x2 - pad_x) / scale_x, 0.0), source_width),
+            min(max((y2 - pad_y) / scale_y, 0.0), source_height),
+        )
+
     def _letterbox(self, image: Image.Image, fill: int = 114) -> Image.Image:
         '''
         Resize preserving aspect ratio, centered on a constant-filled canvas of
