@@ -18,4 +18,5 @@
     <exec_depend>sensor_msgs</exec_depend>
 
     <depend>std_msgs</depend>
+    <depend>vision_msgs</depend>
 </package>
