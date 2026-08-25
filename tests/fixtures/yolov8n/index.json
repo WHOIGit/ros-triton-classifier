@@ -1,0 +1,17 @@
+{
+  "datatype": "FP32",
+  "input_name": "images",
+  "requests": [
+    {
+      "class_count": 0,
+      "fill": null,
+      "name": "gradient"
+    }
+  ],
+  "shape": [
+    1,
+    3,
+    640,
+    640
+  ]
+}

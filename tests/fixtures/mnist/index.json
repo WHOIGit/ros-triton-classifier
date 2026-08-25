@@ -1,0 +1,27 @@
+{
+  "datatype": "FP32",
+  "input_name": "Input3",
+  "requests": [
+    {
+      "class_count": 0,
+      "fill": 0.0,
+      "name": "zeros"
+    },
+    {
+      "class_count": 0,
+      "fill": null,
+      "name": "gradient"
+    },
+    {
+      "class_count": 3,
+      "fill": null,
+      "name": "gradient_top3"
+    }
+  ],
+  "shape": [
+    1,
+    1,
+    28,
+    28
+  ]
+}
