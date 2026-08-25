@@ -20,6 +20,23 @@ Python 3.8) the `[all]` and `[http]` extras fail to build because they pull in
 
     python3 -m pip install tritonclient[grpc]
 
+## Tests
+
+    python3 -m pytest tests/
+
+The tests need no Triton server. `tests/fixtures/` holds real gRPC responses
+recorded from a live server for two small models -- `mnist` (a classifier,
+`[1,1,28,28]` -> `[1,10]`) and `yolov8n` (a detector, `[1,3,640,640]` ->
+`[1,84,8400]`) -- and `tests/fake_triton.py` replays those recorded protobufs
+through the same client types the real library returns. So the tests exercise
+how `triton_api` builds requests and interprets responses, against responses a
+server actually produced, offline and in under a second.
+
+To re-record after changing the models or the Triton version, serve `mnist` and
+`yolov8n` and run:
+
+    python3 tests/record_fixtures.py -u localhost:8001
+
 ### Server (Jetson)
 
 `triton/Dockerfile.jetson` builds a Triton Inference Server image for JetPack
