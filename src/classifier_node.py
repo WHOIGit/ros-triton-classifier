@@ -61,16 +61,20 @@ def main():
     setattr(model, input_name, ImageInput(scaling=ScalingMode.INCEPTION))
     setattr(model, output_name, ClassificationOutput(classes=3))
 
+    image_topic = rospy.get_param('~image_topic')
+
     # Advertise that we will publish a "/class" subtopic of the image topic
     class_pub = rospy.Publisher(
-        rospy.get_param('~image_topic') + '/class',
+        image_topic + '/class',
         Classification,
         queue_size=1
     )
 
-    # Subscribe to the raw image data
+    # Subscribe to the raw image data. image_transport publishes the raw
+    # sensor_msgs/Image on the base topic itself -- only the other transports
+    # get "<base topic>/<transport name>" subtopics -- so do not append /raw.
     rospy.Subscriber(
-        rospy.get_param('~image_topic') + '/raw',
+        image_topic,
         Image,
         functools.partial(on_image, model, output_name, class_pub)
     )
