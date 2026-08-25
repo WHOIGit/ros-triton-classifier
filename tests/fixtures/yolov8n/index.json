@@ -5,7 +5,14 @@
     {
       "class_count": 0,
       "fill": null,
+      "image": null,
       "name": "gradient"
+    },
+    {
+      "class_count": 0,
+      "fill": null,
+      "image": "assets/bus.jpg",
+      "name": "bus"
     }
   ],
   "shape": [
