@@ -129,9 +129,15 @@ class TensorInput(ModelInput):
 class ImageInput(ModelInput):
     def __init__(self, scaling: ScalingMode = ScalingMode.NONE,
                  layout: str = None,  # type: ignore[assignment]
+                 letterbox: bool = False,
                  size: tuple = None):  # type: ignore[assignment]
         super().__init__()
         self.scaling = scaling
+        # Preserve aspect ratio by scaling to fit and padding the remainder,
+        # instead of stretching the image to the model's exact input size.
+        # Detection models (YOLO and friends) are trained this way, and feeding
+        # them a stretched image silently shifts every predicted box.
+        self.letterbox = letterbox
         # Channel layout, 'NCHW' or 'NHWC'. If None it is taken from the model
         # config's `format` field; pass it explicitly for models whose config
         # does not declare a format (common for ONNX detectors, where `format`
@@ -200,7 +206,10 @@ class ImageInput(ModelInput):
 
         # Scale the image down to size. Bilinear scaling is fine:
         # https://medium.com/neuronio/how-to-deal-with-image-resizing-in-deep-learning-e5177fad7d89
-        image = image.resize((self.width, self.height), Image.BILINEAR)
+        if self.letterbox:
+            image = self._letterbox(image)
+        else:
+            image = image.resize((self.width, self.height), Image.BILINEAR)
 
         # Convert the image to a nparray. Scaling produces fractional values, so
         # it is only meaningful for a float input tensor; catch an integer one
@@ -227,8 +236,24 @@ class ImageInput(ModelInput):
             array -= 1
         else:
             raise NotImplementedError('Scaling mode is not implemented yet')
-        
+
         return array
+
+    def _letterbox(self, image: Image.Image, fill: int = 114) -> Image.Image:
+        '''
+        Resize preserving aspect ratio, centered on a constant-filled canvas of
+        the model's input size. This matches how detection models are trained.
+        '''
+        scale = min(self.width / image.width, self.height / image.height)
+        new_size = (max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)))
+        resized = image.resize(new_size, Image.BILINEAR)
+
+        background = fill if image.mode == 'L' else (fill,) * len(image.getbands())
+        canvas = Image.new(image.mode, (self.width, self.height), background)
+        canvas.paste(resized, ((self.width - new_size[0]) // 2,
+                               (self.height - new_size[1]) // 2))
+        return canvas
 
     def process(self, value: Union[Image.Image, List[Image.Image]]) \
             -> np.ndarray:
