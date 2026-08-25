@@ -51,6 +51,7 @@ class ScalingMode(enum.Enum):
     NONE = 0
     INCEPTION = 1
     VGG = 2
+    NORM = 3  # scale pixel values to the range 0..1 (divide by 255), e.g. YOLO
 
 
 class Classification(NamedTuple):
@@ -126,31 +127,50 @@ class TensorInput(ModelInput):
 
 
 class ImageInput(ModelInput):
-    def __init__(self, scaling: ScalingMode = ScalingMode.NONE):
+    def __init__(self, scaling: ScalingMode = ScalingMode.NONE,
+                 layout: str = None):  # type: ignore[assignment]
         super().__init__()
         self.scaling = scaling
+        # Channel layout, 'NCHW' or 'NHWC'. If None it is taken from the model
+        # config's `format` field; pass it explicitly for models whose config
+        # does not declare a format (common for ONNX detectors, where `format`
+        # cannot be set because the input tensor keeps an explicit batch dim).
+        self.layout = layout
         self.channels = self.width = self.height = 0
+        self._rank = 0  # rank of the model's input tensor (3 or 4)
 
     def bind(self, model: 'Model', name: str):
         super().bind(model, name)
 
-        # Extract number of channels, height, and width from the input tensor
-        # shape, depending on the model's declared format (NHWC or NCHW).
-        expected_dims = 3 + (1 if self.model.can_batch else 0)
-        assert len(self.metadata.shape) == expected_dims
+        shape = list(self.metadata.shape)
+        self._rank = len(shape)
+        if self._rank not in (3, 4):
+            raise ValueError(
+                f'ImageInput expects a rank-3 or rank-4 input, got {shape}')
 
-        if self.config.format == model_config_pb2.ModelInput.Format.FORMAT_NHWC:
-            self.height = self.metadata.shape[1 if self.model.can_batch else 0]
-            self.width = self.metadata.shape[2 if self.model.can_batch else 1]
-            self.channels = \
-                self.metadata.shape[3 if self.model.can_batch else 2]
-        elif self.config.format == model_config_pb2.ModelInput.Format.FORMAT_NCHW:
-            self.channels = \
-                self.metadata.shape[1 if self.model.can_batch else 0]
-            self.height = self.metadata.shape[2 if self.model.can_batch else 1]
-            self.width = self.metadata.shape[3 if self.model.can_batch else 2]
-        else:
-            raise ValueError('Unexpected input format')
+        # Determine the channel layout: an explicit override wins, otherwise
+        # fall back to the model config's declared format.
+        layout = self.layout
+        if layout is None:
+            fmt = self.config.format
+            if fmt == model_config_pb2.ModelInput.Format.FORMAT_NCHW:
+                layout = 'NCHW'
+            elif fmt == model_config_pb2.ModelInput.Format.FORMAT_NHWC:
+                layout = 'NHWC'
+            else:
+                raise ValueError(
+                    'Model config does not declare an input format; pass '
+                    "layout='NCHW' or 'NHWC' to ImageInput()")
+        if layout not in ('NCHW', 'NHWC'):
+            raise ValueError(f'Unknown layout {layout!r}')
+        self.layout = layout
+
+        # Channels/height/width are the trailing three dims; any leading batch
+        # dimension (fixed like [1, ...] or dynamic like [-1, ...]) is ignored.
+        if layout == 'NCHW':
+            self.channels, self.height, self.width = shape[-3], shape[-2], shape[-1]
+        else:  # NHWC
+            self.height, self.width, self.channels = shape[-3], shape[-2], shape[-1]
 
     def _process_one(self, image: Image.Image) -> np.ndarray:
         # Convert the image to the model's expected channel count
@@ -173,9 +193,11 @@ class ImageInput(ModelInput):
         if array.ndim == 2:
             array = array[:, :, np.newaxis]
 
-        # Apply scaling to the range -1..1 for Inception models
+        # Apply optional pixel scaling.
         if self.scaling == ScalingMode.NONE:
             pass
+        elif self.scaling == ScalingMode.NORM:
+            array /= 255.0
         elif self.scaling == ScalingMode.INCEPTION:
             array /= 127.5
             array -= 1
@@ -197,14 +219,15 @@ class ImageInput(ModelInput):
             raise ValueError('Input expects exactly one image')
 
         # Process all of the images into a batch in NHWC format
-        processed = np.stack([ self._process_one(image) for image in value ])
+        processed = np.stack([self._process_one(image) for image in value])
 
-        # If the model expects (N)CHW instead, re-arrange the axes
-        if self.config.format == model_config_pb2.ModelInput.FORMAT_NCHW:
+        # If the model expects channels-first, re-arrange NHWC -> NCHW
+        if self.layout == 'NCHW':
             processed = np.transpose(processed, (0, 3, 1, 2))
 
-        # Return either a single or a batch of processed images
-        if not self.model.can_batch:
+        # Keep the leading batch axis only if the model's input tensor has one
+        # (rank 4). A rank-3 input wants a single [C,H,W] / [H,W,C] array.
+        if self._rank == 3:
             return processed[0]
         return processed
 
@@ -397,9 +420,9 @@ class Model:
                 if result.shape[0] > self.max_batch_size:
                     raise ValueError('Too many inputs in batch')
             else:
-                assert result.shape[0] == inputobj.metadata.shape[0]
-                assert result.shape[1] == inputobj.metadata.shape[1]
-                assert result.shape[2] == inputobj.metadata.shape[2]
+                assert list(result.shape) == list(inputobj.metadata.shape), \
+                    (f'processed input shape {list(result.shape)} does not '
+                     f'match model shape {list(inputobj.metadata.shape)}')
 
             # Create the InferInput object for this input
             req_inputs.append(tritonclient.grpc.InferInput(
@@ -461,46 +484,57 @@ def main():
     import pprint
     import time
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='Submit image(s) to a Triton model and print the results.')
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('-m', '--model-name', required=True)
     parser.add_argument('-x', '--model-version', default='')
-    parser.add_argument('-b', '--batch-size', type=int, default=1)
-    parser.add_argument('-c', '--classes', type=int, default=3)
+    parser.add_argument('-c', '--classes', type=int, default=3,
+                        help='classes to request (classification mode)')
     parser.add_argument('-t', '--image-transform',
-                        choices=['NONE', 'INCEPTION', 'VGG'], default='NONE')
+                        choices=['NONE', 'NORM', 'INCEPTION', 'VGG'],
+                        default='NONE')
+    parser.add_argument('-l', '--layout', choices=['NCHW', 'NHWC'], default=None,
+                        help="channel layout when the model config omits `format`")
+    parser.add_argument('--raw', action='store_true',
+                        help='return the raw output tensor instead of parsing '
+                             'classifications (e.g. for detection models)')
     parser.add_argument('-u', '--url', default='localhost:8001')
     parser.add_argument('images', nargs='+')
     args = parser.parse_args()
 
-    # This script only supports Inception input transformation right now
-    assert args.image_transform == 'INCEPTION'
+    model = initialize_model(args.url, args.model_name, args.verbose,
+                             args.model_version)
 
-    model = initialize_model(args.url, args.model_name, args.verbose, args.model_version)
-    
-    model.input = ImageInput(scaling=ScalingMode.INCEPTION)
-    model.output = ClassificationOutput(classes=3)
+    # Bind the first input as an image and the first output for our result,
+    # by their actual tensor names (not every model calls them input/output).
+    in_name = model.metadata.inputs[0].name
+    out_name = model.metadata.outputs[0].name
 
-    # Load images
+    setattr(model, in_name, ImageInput(
+        scaling=ScalingMode[args.image_transform], layout=args.layout))
+    if args.raw:
+        setattr(model, out_name, TensorOutput())
+    else:
+        setattr(model, out_name, ClassificationOutput(classes=args.classes))
+
     images = [Image.open(path) for path in args.images]
 
-    # Request inference
-    # TODO: We should batch these according to the models max_batch_size
     start = time.perf_counter()
-    if len(images) > 1 and args.batch_size == 1:
-        for image in images:
-            result = model.infer(image)
-            pprint.pprint(result.output)
-    else: 
-        result = model.infer(images)
-        pprint.pprint(result.output)
+    for image in images:
+        result = model.infer(image)
+        value = getattr(result, out_name)
+        if args.raw:
+            arr = np.asarray(value)
+            print(f'{out_name}: shape={arr.shape} dtype={arr.dtype} '
+                  f'min={float(arr.min()):.4f} max={float(arr.max()):.4f}')
+        else:
+            pprint.pprint(value)
     stop = time.perf_counter()
 
-    # Display the output
-    print(
-        f'Processed {len(images)} images in {(stop - start):0.3f} seconds '
-        f'({(stop - start)/len(images):0.3f} sec per image)'
-    )
+    n = len(images)
+    print(f'Processed {n} image(s) in {(stop - start):0.3f} s '
+          f'({(stop - start) / n:0.3f} s per image)')
 
 
 if __name__ == '__main__':
