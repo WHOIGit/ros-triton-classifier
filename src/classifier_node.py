@@ -137,10 +137,10 @@ def build_classification(classifications, image_msg):
     '''
     Convert triton_api Classifications into a vision_msgs/Classification2D.
 
-    NOTE: vision_msgs says score "should lie in the range [0-1]", but Triton
-    applies no activation, so these are raw logits. They cannot be normalized
-    correctly here because class_count only returns the top N of them -- see
-    issue #5.
+    vision_msgs says score "should lie in the range [0-1]". The node asks
+    ClassificationOutput to apply a softmax over the model's complete logit
+    vector by default, so that holds; with ~activation='' the scores are the
+    server's raw logits instead and it does not.
     '''
     message = Classification2D()
     message.header = image_msg.header
@@ -170,17 +170,26 @@ def main():
     input_name = model.metadata.inputs[0].name
     output_name = model.metadata.outputs[0].name
 
+    labels = load_class_labels()
+
     if task == 'detection':
         image_input = ImageInput(scaling=ScalingMode.NORM, letterbox=True,
                                  layout=rospy.get_param('~layout', None))
         output = DetectionOutput(
             confidence=rospy.get_param('~confidence_threshold', 0.25),
-            iou=rospy.get_param('~iou_threshold', 0.45))
+            iou=rospy.get_param('~iou_threshold', 0.45),
+            labels=labels or None)
     else:
         image_input = ImageInput(scaling=ScalingMode.INCEPTION,
                                  layout=rospy.get_param('~layout', None))
+        # Normalize locally by default so that `score` is a probability, as
+        # vision_msgs expects. Set ~activation to '' for the server's raw
+        # logits, or to 'sigmoid' for a multi-label model.
+        activation = rospy.get_param('~activation', 'softmax') or None
         output = ClassificationOutput(
-            classes=rospy.get_param('~classes', 3))
+            classes=rospy.get_param('~classes', 3),
+            activation=activation,
+            labels=labels or None)
 
     setattr(model, input_name, image_input)
     setattr(model, output_name, output)
@@ -196,7 +205,6 @@ def main():
 
     # Advertise where the id -> name map lives. Latched, so that subscribers
     # which come up after us still receive it.
-    labels = load_class_labels()
     info = VisionInfo()
     info.header.stamp = rospy.Time.now()
     info.method = model_name
