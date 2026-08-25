@@ -16,7 +16,7 @@ from triton_classifier.msg import Classification, ObjectHypothesisWithClassName
 
 
 
-def on_image(model, class_pub, image_msg):
+def on_image(model, output_name, class_pub, image_msg):
     # Use the cv_bridge to convert to an OpenCV image object
     img = CvBridge().imgmsg_to_cv2(image_msg)
     # Convert the OpenCV image to a PIL image
@@ -30,7 +30,8 @@ def on_image(model, class_pub, image_msg):
         raise e
 
     # Null-check response
-    if len(result.output) < 1:
+    classifications = getattr(result, output_name)
+    if len(classifications) < 1:
        raise ValueError('Unexpected result from classifier', repr(result))
 
     # Format message and publish
@@ -38,7 +39,7 @@ def on_image(model, class_pub, image_msg):
     classification.header = image_msg.header
     classification.results = []
 
-    for r in result.output:
+    for r in classifications:
         h = ObjectHypothesisWithClassName()
         h.class_name = r.class_name
         h.score = r.score
@@ -51,8 +52,14 @@ def main():
     rospy.init_node('classifier', anonymous=True)
 
     model = initialize_model(rospy.get_param('~triton_server_url'), rospy.get_param('~classifier_model'))
-    model.input = ImageInput(scaling=ScalingMode.INCEPTION)
-    model.output = ClassificationOutput(classes=3)
+
+    # Bind by the model's own tensor names; they are not always input/output.
+    # Assigning an attribute that is not a real tensor name would silently skip
+    # bind(), leaving the default TensorInput in place.
+    input_name = model.metadata.inputs[0].name
+    output_name = model.metadata.outputs[0].name
+    setattr(model, input_name, ImageInput(scaling=ScalingMode.INCEPTION))
+    setattr(model, output_name, ClassificationOutput(classes=3))
 
     # Advertise that we will publish a "/class" subtopic of the image topic
     class_pub = rospy.Publisher(
@@ -65,7 +72,7 @@ def main():
     rospy.Subscriber(
         rospy.get_param('~image_topic') + '/raw',
         Image,
-        functools.partial(on_image, model, class_pub)
+        functools.partial(on_image, model, output_name, class_pub)
     )
 
     rospy.spin()
