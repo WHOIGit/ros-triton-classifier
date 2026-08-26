@@ -15,6 +15,7 @@ processing of their inptus and outputs, like image classification models:
 
 import enum
 import functools
+import warnings
 
 from typing import Any, List, NamedTuple, Union, cast
 
@@ -23,6 +24,7 @@ import tritonclient.grpc
 
 from PIL import Image
 from tritonclient.grpc import model_config_pb2, service_pb2
+from tritonclient.utils import triton_to_np_dtype
 
 
 def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -38,20 +40,23 @@ def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
     return exp / np.sum(exp, axis=axis, keepdims=True)
 
 
-def model_dtype_to_np(model_dtype: str) -> object:
-    return {
-        'BOOL':   bool,
-        'INT8':   np.int8,
-        'INT16':  np.int16,
-        'INT32':  np.int32,
-        'INT64':  np.int64,
-        'UINT8':  np.uint8,
-        'UINT16': np.uint16,
-        'FP16':   np.float16,
-        'FP32':   np.float32,
-        'FP64':   np.float64,
-        'BYTES':  np.dtype(object),
-    }[model_dtype]
+def model_dtype_to_np(model_dtype: str) -> np.dtype:
+    # tritonclient ships the full Triton -> numpy mapping (including UINT32,
+    # UINT64, and BF16, which a hand-rolled table here used to omit).
+    np_dtype = triton_to_np_dtype(model_dtype)
+    if np_dtype is None:
+        raise ValueError(f'Unsupported model datatype {model_dtype!r}')
+    return np.dtype(np_dtype)
+
+
+def shape_matches(actual, expected) -> bool:
+    '''
+    Compare a concrete tensor shape against a model-declared one, where -1
+    marks a dimension the model leaves dynamic (any size satisfies it).
+    '''
+    actual, expected = list(actual), list(expected)
+    return len(actual) == len(expected) and \
+        all(e == -1 or a == e for a, e in zip(actual, expected))
 
 
 class ScalingMode(enum.Enum):
@@ -131,8 +136,12 @@ class ModelInput:
 
 class TensorInput(ModelInput):
     def process(self, value: np.ndarray) -> np.ndarray:
-        # If we received a single input and expected a batch, reshape
-        if self.model.can_batch and len(self.metadata.shape) == value.ndim + 1:
+        # If we received a single input and the tensor carries a batch axis --
+        # either implicitly (max_batch_size > 0) or an explicit dynamic leading
+        # dimension -- reshape into a batch of one.
+        shape = self.metadata.shape
+        if len(shape) == value.ndim + 1 and \
+                (self.model.can_batch or shape[0] == -1):
             return value.reshape([1] + list(value.shape))
 
         # Otherwise, pass through unmodified
@@ -189,10 +198,21 @@ class ImageInput(ModelInput):
         else:  # NHWC
             self.height, self.width, self.channels = shape[-3], shape[-2], shape[-1]
 
-        # Triton reports -1 for any dimension the model leaves dynamic, which is
-        # not a usable image size. Fall back to an explicit size= if given.
+        # Triton reports -1 for any dimension the model leaves dynamic, which
+        # is not a usable image size. Fall back to an explicit size= for those
+        # dimensions only; a size= that contradicts a fixed declared dimension
+        # is a configuration error, not an override.
         if self.size is not None:
-            self.width, self.height = self.size
+            want_w, want_h = self.size
+            if (self.width > 0 and self.width != want_w) or \
+                    (self.height > 0 and self.height != want_h):
+                raise ValueError(
+                    f'size={self.size} contradicts the model-declared input '
+                    f'size ({self.width}, {self.height})')
+            if self.width < 1:
+                self.width = want_w
+            if self.height < 1:
+                self.height = want_h
         if self.width < 1 or self.height < 1:
             raise ValueError(
                 f'Model declares dynamic spatial dimensions {shape}; pass '
@@ -201,6 +221,27 @@ class ImageInput(ModelInput):
             raise ValueError(
                 f'Model declares a dynamic channel count in {shape}; '
                 'ImageInput needs a fixed 1- or 3-channel input')
+
+        # How many images one request may carry: the model either batches via
+        # max_batch_size (Triton adds the axis itself), or declares an explicit
+        # leading batch dimension of its own (-1 for unbounded, or a fixed
+        # count). None means unbounded.
+        if model.can_batch:
+            self._capacity = model.max_batch_size
+        elif self._rank == 4:
+            self._capacity = shape[0] if shape[0] > 0 else None
+        else:
+            self._capacity = 1
+
+        # Resolve the tensor dtype once, and catch a scaling mode bound to an
+        # integer tensor here rather than on the first frame: scaling produces
+        # fractional values, so it is only meaningful for a float tensor.
+        self.dtype = model_dtype_to_np(self.metadata.datatype)
+        if self.scaling != ScalingMode.NONE and \
+                not np.issubdtype(self.dtype, np.floating):
+            raise ValueError(
+                f'{self.scaling.name} scaling requires a floating-point input '
+                f'tensor, but the model expects {self.metadata.datatype}')
 
     def _process_one(self, image: Image.Image) -> np.ndarray:
         # Convert the image to the model's expected channel count
@@ -215,16 +256,9 @@ class ImageInput(ModelInput):
         # https://medium.com/neuronio/how-to-deal-with-image-resizing-in-deep-learning-e5177fad7d89
         image = image.resize((self.width, self.height), Image.BILINEAR)
 
-        # Convert the image to a nparray. Scaling produces fractional values, so
-        # it is only meaningful for a float input tensor; catch an integer one
-        # here rather than letting numpy raise an opaque casting error below.
-        dtype = np.dtype(model_dtype_to_np(self.metadata.datatype))
-        if self.scaling != ScalingMode.NONE and not np.issubdtype(dtype,
-                                                                  np.floating):
-            raise ValueError(
-                f'{self.scaling.name} scaling requires a floating-point input '
-                f'tensor, but the model expects {self.metadata.datatype}')
-        array = np.array(image).astype(dtype)
+        # Convert the image to an ndarray, casting straight into the model's
+        # dtype (resolved once at bind time) in a single pass.
+        array = np.array(image, dtype=self.dtype)
 
         # If the image is grayscale, add a channel axis (HW -> HWC)
         if array.ndim == 2:
@@ -252,8 +286,9 @@ class ImageInput(ModelInput):
             value = [value]
         value = cast(List[Image.Image], value)
 
-        if not self.model.can_batch and len(value) != 1:
-            raise ValueError('Input expects exactly one image')
+        if self._capacity is not None and len(value) > self._capacity:
+            raise ValueError(
+                f'Model accepts at most {self._capacity} image(s) per request')
 
         # Process all of the images into a batch in NHWC format
         processed = np.stack([self._process_one(image) for image in value])
@@ -340,6 +375,12 @@ class ClassificationOutput(ModelOutput):
         '''
         fields = c.decode().split(':', maxsplit=2)
         if len(fields) == 2:
+            # Tolerated, but worth one loud note: without label_filename in the
+            # model config every published class_name will be empty.
+            warnings.warn(
+                'Triton returned classifications without class names; the '
+                'model config likely does not set label_filename',
+                stacklevel=2)
             (score, class_id), class_name = fields, ''
         elif len(fields) == 3:
             score, class_id, class_name = fields
@@ -472,21 +513,23 @@ class Model:
             result = kwargs[key] = inputobj.process(value)
             assert isinstance(result, np.ndarray)
 
-            # After processing, assert that each ndarray's shape matches the
-            # model's expected shape.
+            # After processing, check that each ndarray's shape matches the
+            # model's declared shape (shape_matches treats -1 as a wildcard).
+            # A real raise, not an assert: this must survive `python -O`.
             if self.can_batch:
-                assert result.shape[1:] == tuple(inputobj.metadata.shape[1:])
+                if not shape_matches(result.shape[1:],
+                                     inputobj.metadata.shape[1:]):
+                    raise ValueError(
+                        f'processed input shape {list(result.shape)} does not '
+                        f'match model shape '
+                        f'[batch, {", ".join(map(str, inputobj.metadata.shape[1:]))}]')
                 if result.shape[0] > self.max_batch_size:
                     raise ValueError('Too many inputs in batch')
             else:
-                # -1 marks a dimension the model leaves dynamic, which any
-                # size satisfies.
-                actual, expected = \
-                    list(result.shape), list(inputobj.metadata.shape)
-                assert len(actual) == len(expected) and \
-                    all(e == -1 or a == e for a, e in zip(actual, expected)), \
-                    (f'processed input shape {actual} does not '
-                     f'match model shape {expected}')
+                if not shape_matches(result.shape, inputobj.metadata.shape):
+                    raise ValueError(
+                        f'processed input shape {list(result.shape)} does not '
+                        f'match model shape {list(inputobj.metadata.shape)}')
 
             # Create the InferInput object for this input
             req_inputs.append(tritonclient.grpc.InferInput(
@@ -555,11 +598,17 @@ def main():
     parser.add_argument('-x', '--model-version', default='')
     parser.add_argument('-c', '--classes', type=int, default=3,
                         help='classes to request (classification mode)')
+    # ScalingMode.VGG exists in the enum but has no implementation yet, so it
+    # is deliberately not offered here.
     parser.add_argument('-t', '--image-transform',
-                        choices=['NONE', 'NORM', 'INCEPTION', 'VGG'],
+                        choices=['NONE', 'NORM', 'INCEPTION'],
                         default='NONE')
     parser.add_argument('-l', '--layout', choices=['NCHW', 'NHWC'], default=None,
                         help="channel layout when the model config omits `format`")
+    parser.add_argument('-s', '--size', type=int, nargs=2, default=None,
+                        metavar=('WIDTH', 'HEIGHT'),
+                        help='input size for models that declare dynamic '
+                             'spatial dimensions')
     parser.add_argument('--raw', action='store_true',
                         help='return the raw output tensor instead of parsing '
                              'classifications (e.g. for detection models)')
@@ -576,7 +625,8 @@ def main():
     out_name = model.metadata.outputs[0].name
 
     setattr(model, in_name, ImageInput(
-        scaling=ScalingMode[args.image_transform], layout=args.layout))
+        scaling=ScalingMode[args.image_transform], layout=args.layout,
+        size=tuple(args.size) if args.size else None))
     if args.raw:
         setattr(model, out_name, TensorOutput())
     else:
@@ -590,8 +640,12 @@ def main():
         value = getattr(result, out_name)
         if args.raw:
             arr = np.asarray(value)
-            print(f'{out_name}: shape={arr.shape} dtype={arr.dtype} '
-                  f'min={float(arr.min()):.4f} max={float(arr.max()):.4f}')
+            # min/max only exist for a non-empty numeric tensor (a detector
+            # may legitimately return zero rows, or a BYTES output).
+            stats = ''
+            if arr.size and np.issubdtype(arr.dtype, np.number):
+                stats = f' min={float(arr.min()):.4f} max={float(arr.max()):.4f}'
+            print(f'{out_name}: shape={arr.shape} dtype={arr.dtype}{stats}')
         else:
             pprint.pprint(value)
     stop = time.perf_counter()
