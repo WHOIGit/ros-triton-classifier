@@ -13,3 +13,14 @@ The message definitions are similar to [`vision_msgs`][vision_msgs] but it does 
 Please install the `tritonclient[all]` Python package:
 
     python3 -m pip install tritonclient[all]
+
+### Server (Jetson)
+
+`triton/Dockerfile.jetson` builds a Triton Inference Server image for JetPack
+5.1.x (L4T r35.x); see the comments in that file. Build and run with:
+
+    docker build -t triton-jetson:2.35.0-jp512 -f triton/Dockerfile.jetson triton
+    docker run --rm --runtime nvidia --ipc=host \
+        -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+        -v /path/to/models:/models \
+        triton-jetson:2.35.0-jp512 tritonserver --model-repository=/models
