@@ -81,7 +81,7 @@ def test_detections_become_a_detection2darray(node, image_msg):
     from vision_msgs.msg import Detection2DArray
 
     detections, image_input, image = bus_detections()
-    array = node.build_detections(detections, image_input, image.size, image_msg)
+    array = node.build_detections(detections, image.size, image_msg, image_input)
 
     assert isinstance(array, Detection2DArray)
     assert array.header.frame_id == 'camera'
@@ -95,7 +95,7 @@ def test_detections_become_a_detection2darray(node, image_msg):
 def test_boxes_are_in_original_image_pixels(node, image_msg):
     '''The model saw a letterboxed 640x640; consumers need the photo's pixels.'''
     detections, image_input, image = bus_detections()
-    array = node.build_detections(detections, image_input, image.size, image_msg)
+    array = node.build_detections(detections, image.size, image_msg, image_input)
 
     width, height = image.size          # 810x1080
     for detection in array.detections:
@@ -118,7 +118,7 @@ def test_detection2darray_serializes(node, image_msg):
     from io import BytesIO
 
     detections, image_input, image = bus_detections()
-    array = node.build_detections(detections, image_input, image.size, image_msg)
+    array = node.build_detections(detections, image.size, image_msg, image_input)
 
     buffer = BytesIO()
     array.serialize(buffer)
@@ -140,7 +140,7 @@ def test_classifications_become_a_classification2d(node, image_msg):
     setattr(model, out_name, triton_api.ClassificationOutput(classes=3))
 
     results = getattr(model.infer(Image.new('L', (28, 28))), out_name)
-    message = node.build_classification(results, image_msg)
+    message = node.build_classification(results, (28, 28), image_msg)
 
     assert isinstance(message, Classification2D)
     assert len(message.results) == 3

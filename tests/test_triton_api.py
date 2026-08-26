@@ -26,10 +26,22 @@ from fake_triton import FakeInferenceServerClient  # noqa: E402
 BUS_JPG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'assets', 'bus.jpg')
 
-# The first handful of COCO classes, enough to name what is in bus.jpg.
+# All 80 COCO classes, in id order. DetectionOutput checks the label count
+# against the model's class axis, so a truncated list is rejected.
 COCO_CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
-    'truck', 'boat', 'traffic light',
+    'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
+    'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+    'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon',
+    'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
+    'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
+    'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote',
+    'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
+    'hair drier', 'toothbrush',
 ]
 
 
@@ -209,43 +221,43 @@ def test_bus_detections_map_back_onto_the_original_photo():
 
 
 def test_scaling_rejects_integer_input_tensors():
-    model, _ = make_model('mnist')
-    image_input = triton_api.ImageInput(scaling=triton_api.ScalingMode.NORM,
-                                        layout='NCHW')
-    model.Input3 = image_input
-
+    '''A scaling mode bound to an integer tensor must fail at bind time.'''
+    client = FakeInferenceServerClient('mnist')
     # Pretend the model wants uint8, as a quantized model would.
-    image_input.metadata = type('Meta', (), {'datatype': 'UINT8',
-                                             'shape': [1, 1, 28, 28]})()
+    client.metadata.inputs[0].datatype = 'UINT8'
+    model = triton_api.Model(client, 'mnist')
+
     with pytest.raises(ValueError, match='requires a floating-point'):
-        image_input._process_one(Image.new('L', (28, 28)))
+        model.Input3 = triton_api.ImageInput(
+            scaling=triton_api.ScalingMode.NORM, layout='NCHW')
 
 
 def test_dynamic_spatial_dims_are_reported_clearly():
-    model, _ = make_model('yolov8n')
-    image_input = triton_api.ImageInput(layout='NCHW')
-    # Simulate an export with dynamic axes by rewriting the bound metadata.
+    '''Binding to a dynamic-axes export must raise the real library error.'''
+    client = FakeInferenceServerClient('yolov8n')
+    client.metadata.inputs[0].shape[:] = [1, 3, -1, -1]
+    model = triton_api.Model(client, 'yolov8n')
+
     with pytest.raises(ValueError, match='dynamic spatial dimensions'):
-        image_input.model = None
-        image_input.config = type('Cfg', (), {'format': 0})()
-        image_input.metadata = type('Meta', (), {'datatype': 'FP32',
-                                                 'shape': [1, 3, -1, -1]})()
-        shape = list(image_input.metadata.shape)
-        image_input._rank = len(shape)
-        image_input.layout = 'NCHW'
-        image_input.channels, image_input.height, image_input.width = \
-            shape[-3], shape[-2], shape[-1]
-        if image_input.size is not None:
-            image_input.width, image_input.height = image_input.size
-        if image_input.width < 1 or image_input.height < 1:
-            raise ValueError(
-                f'Model declares dynamic spatial dimensions {shape}; pass '
-                'size=(width, height) to ImageInput() to choose the input size')
+        model.images = triton_api.ImageInput(layout='NCHW')
 
 
 def test_size_override_supplies_a_concrete_size():
+    '''size= fills in the dynamic dimensions and makes bind() succeed.'''
+    client = FakeInferenceServerClient('yolov8n')
+    client.metadata.inputs[0].shape[:] = [1, 3, -1, -1]
+    model = triton_api.Model(client, 'yolov8n')
+
     image_input = triton_api.ImageInput(layout='NCHW', size=(320, 240))
-    assert image_input.size == (320, 240)
+    model.images = image_input
+    assert (image_input.width, image_input.height) == (320, 240)
+
+
+def test_size_override_must_agree_with_fixed_dims():
+    '''size= cannot silently override a size the model declares as fixed.'''
+    model, _ = make_model('yolov8n')
+    with pytest.raises(ValueError, match='contradicts'):
+        model.images = triton_api.ImageInput(layout='NCHW', size=(320, 240))
 
 
 # -- outputs ---------------------------------------------------------------
@@ -473,12 +485,15 @@ def test_detection_confidence_threshold_filters():
     model.output0 = triton_api.DetectionOutput(confidence=0.01)
     low = model.infer(Image.new('RGB', (640, 640))).output0
 
-    model.output0 = None  # unbind before rebinding
-    model._outputs.add('output0')
+    # Plain reassignment rebinds an output; no private state involved.
     model.output0 = triton_api.DetectionOutput(confidence=0.99)
     high = model.infer(Image.new('RGB', (640, 640))).output0
 
-    assert len(high) <= len(low)
+    # A permissive threshold must find something and a strict one must
+    # actually discard some of it, or this test cannot detect a broken
+    # filter (0 <= 0 would pass a filter that drops everything).
+    assert len(low) > 0
+    assert len(high) < len(low)
 
 
 def test_detection_labels_name_the_classes():
@@ -530,17 +545,88 @@ def test_infer_rejects_mixing_positional_and_keyword():
 def test_non_batching_model_rejects_a_list_of_images():
     model, _ = make_model('mnist')
     model.Input3 = triton_api.ImageInput(layout='NCHW')
-    with pytest.raises(ValueError, match='exactly one image'):
+    with pytest.raises(ValueError, match='at most 1 image'):
         model.infer([Image.new('L', (28, 28)), Image.new('L', (28, 28))])
 
 
 def test_model_and_version_are_passed_through():
-    model, client = make_model('mnist')
+    client = FakeInferenceServerClient('mnist', response='gradient',
+                                       model_version='7')
+    model = triton_api.Model(client, 'mnist', version='7')
     model.Input3 = triton_api.ImageInput(layout='NCHW')
     model.Plus214_Output_0 = triton_api.TensorOutput()
 
     model.infer(Image.new('L', (28, 28)))
+    # The fake raises on any name/version mismatch, so reaching these
+    # assertions already proves config/metadata carried them too.
     assert client.last_request.model_name == 'mnist'
+    assert client.last_request.model_version == '7'
+
+
+def test_fake_validates_the_requested_model_name():
+    client = FakeInferenceServerClient('mnist')
+    with pytest.raises(AssertionError, match='serves'):
+        triton_api.Model(client, 'some_other_model')
+
+
+# -- batching models -------------------------------------------------------
+
+def make_batched_mnist(response=None):
+    '''
+    No fixture was recorded from a batch-enabled model, so derive one: give
+    mnist a max_batch_size and the implicit leading batch axis Triton reports
+    for such models. The recorded single-image responses replay unchanged as
+    batches of one.
+    '''
+    client = FakeInferenceServerClient('mnist', response=response)
+    client.config.config.max_batch_size = 8
+    client.metadata.inputs[0].shape[:] = [-1, 1, 28, 28]
+    client.metadata.outputs[0].shape[:] = [-1, 10]
+    return triton_api.Model(client, 'mnist'), client
+
+
+def test_batching_model_accepts_a_batch_and_checks_shape():
+    model, client = make_batched_mnist(response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.TensorOutput()
+
+    model.infer([Image.new('L', (28, 28))] * 2)
+    assert client.last_request.input_shapes == [[2, 1, 28, 28]]
+
+
+def test_batching_model_enforces_its_batch_capacity():
+    model, _ = make_batched_mnist(response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    with pytest.raises(ValueError, match='at most 8'):
+        model.infer([Image.new('L', (28, 28))] * 9)
+
+
+def test_batching_model_with_dynamic_dims_accepts_size():
+    '''The -1 tolerance must hold on the batching branch of infer() too.'''
+    client = FakeInferenceServerClient('mnist', response='gradient')
+    client.config.config.max_batch_size = 8
+    client.metadata.inputs[0].shape[:] = [-1, 1, -1, -1]
+    client.metadata.outputs[0].shape[:] = [-1, 10]
+    model = triton_api.Model(client, 'mnist')
+
+    model.Input3 = triton_api.ImageInput(layout='NCHW', size=(28, 28))
+    model.Plus214_Output_0 = triton_api.TensorOutput()
+
+    result = model.infer(Image.new('L', (28, 28)))
+    assert np.asarray(result.Plus214_Output_0).shape == (1, 10)
+
+
+def test_explicit_batch_axis_accepts_multiple_images():
+    '''A max_batch_size=0 model with its own dynamic leading dim batches.'''
+    client = FakeInferenceServerClient('mnist', response='gradient')
+    client.metadata.inputs[0].shape[:] = [-1, 1, 28, 28]
+    model = triton_api.Model(client, 'mnist')
+
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.TensorOutput()
+
+    model.infer([Image.new('L', (28, 28))] * 2)
+    assert client.last_request.input_shapes == [[2, 1, 28, 28]]
 
 
 if __name__ == '__main__':

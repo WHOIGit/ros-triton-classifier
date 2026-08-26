@@ -23,10 +23,36 @@ import tritonclient.grpc
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures')
 
+# The fixture naming and compression convention lives HERE, and only here:
+# record_fixtures.py writes through these helpers and this module reads
+# through them, so the two sides cannot drift apart.
 
-def _read(path):
-    with gzip.open(path, 'rb') as f:
+
+def fixture_path(model, filename):
+    '''Path of one gzip-compressed fixture file, e.g. ('mnist', 'config.pb').'''
+    return os.path.join(FIXTURES, model, filename + '.gz')
+
+
+def read_fixture(model, filename):
+    with gzip.open(fixture_path(model, filename), 'rb') as f:
         return f.read()
+
+
+def write_fixture(model, filename, data):
+    os.makedirs(os.path.join(FIXTURES, model), exist_ok=True)
+    with gzip.open(fixture_path(model, filename), 'wb') as f:
+        f.write(data)
+
+
+def read_index(model):
+    with open(os.path.join(FIXTURES, model, 'index.json')) as f:
+        return json.load(f)
+
+
+def write_index(model, index):
+    os.makedirs(os.path.join(FIXTURES, model), exist_ok=True)
+    with open(os.path.join(FIXTURES, model, 'index.json'), 'w') as f:
+        json.dump(index, f, indent=2, sort_keys=True)
 
 
 class RecordedRequest:
@@ -54,11 +80,16 @@ class RecordedRequest:
     def output_names(self):
         return [o.name() for o in self.outputs]
 
-    def input_array(self, index=0):
-        '''The numpy data the library attached to an input, as sent.'''
-        return self.inputs[index]._raw_data_view() \
-            if hasattr(self.inputs[index], '_raw_data_view') \
-            else self.inputs[index]._input.contents
+    @property
+    def output_class_counts(self):
+        '''The server-side class_count requested for each output.'''
+        # Knowledge of InferRequestedOutput's internals stays inside this
+        # module so tests never touch tritonclient privates directly.
+        return [
+            o._output.parameters['classification'].int64_param
+            if 'classification' in o._output.parameters else 0
+            for o in self.outputs
+        ]
 
 
 class FakeInferenceServerClient:
@@ -72,10 +103,24 @@ class FakeInferenceServerClient:
     response:
         Which recorded response to replay from infer(); defaults to the first
         one in the fixture index. Change it between calls to replay another.
+    model_version:
+        The version the library is expected to request; '' accepts only
+        version-less requests.
+
+    The config and metadata protobufs are parsed once at construction and
+    exposed as `self.config` / `self.metadata`; tests may mutate them (e.g.
+    set max_batch_size, or make a dimension dynamic) BEFORE constructing the
+    Model, to exercise library paths no recorded fixture reaches.
+
+    infer() validates each request against the recording -- model name and
+    version, input tensor name/shape/datatype, and the requested class_count
+    -- so a library regression in request construction fails the test that
+    triggered it instead of silently replaying an unrelated response.
     '''
 
-    def __init__(self, model, response=None):
+    def __init__(self, model, response=None, model_version=''):
         self.model = model
+        self.model_version = model_version
         self.directory = os.path.join(FIXTURES, model)
         if not os.path.isdir(self.directory):
             available = sorted(os.path.basename(p)
@@ -83,39 +128,79 @@ class FakeInferenceServerClient:
             raise ValueError(
                 f'No fixtures for model {model!r}; recorded: {available}')
 
-        with open(os.path.join(self.directory, 'index.json')) as f:
-            self.index = json.load(f)
-
+        self.index = read_index(model)
         self.response = response or self.index['requests'][0]['name']
+
+        self.config = service_pb2.ModelConfigResponse()
+        self.config.ParseFromString(read_fixture(model, 'config.pb'))
+        self.metadata = service_pb2.ModelMetadataResponse()
+        self.metadata.ParseFromString(read_fixture(model, 'metadata.pb'))
 
         # Every request the library made, in order, for tests to assert on.
         self.requests = []
 
+    def _check_target(self, what, model_name, model_version):
+        if model_name != self.model:
+            raise AssertionError(
+                f'{what} requested model {model_name!r}, but this fake '
+                f'serves {self.model!r}')
+        if model_version != self.model_version:
+            raise AssertionError(
+                f'{what} requested model version {model_version!r}, '
+                f'expected {self.model_version!r}')
+
     # -- the InferenceServerClient interface the library uses ---------------
 
     def get_model_config(self, model_name, model_version='', as_json=False):
-        response = service_pb2.ModelConfigResponse()
-        response.ParseFromString(_read(os.path.join(self.directory, 'config.pb.gz')))
-        return response
+        self._check_target('get_model_config', model_name, model_version)
+        return self.config
 
     def get_model_metadata(self, model_name, model_version='', as_json=False):
-        response = service_pb2.ModelMetadataResponse()
-        response.ParseFromString(
-            _read(os.path.join(self.directory, 'metadata.pb.gz')))
-        return response
+        self._check_target('get_model_metadata', model_name, model_version)
+        return self.metadata
 
     def infer(self, model_name, inputs, model_version='', outputs=None,
               **kwargs):
-        self.requests.append(RecordedRequest(model_name, model_version,
-                                             list(inputs),
-                                             list(outputs or [])))
+        self._check_target('infer', model_name, model_version)
+        request = RecordedRequest(model_name, model_version,
+                                  list(inputs), list(outputs or []))
+        self.requests.append(request)
 
-        path = os.path.join(self.directory, f'response_{self.response}.pb.gz')
-        if not os.path.exists(path):
+        # Validate the request against what the fixture was recorded with.
+        # Only the leading batch size may differ from the recorded shape;
+        # everything else drifting means the library built a different
+        # request than the recorded response answers.
+        entry = next((r for r in self.index['requests']
+                      if r['name'] == self.response), None)
+        if entry is None:
             raise ValueError(f'No recorded response named {self.response!r}')
+        expected_name = self.index['input_name']
+        expected_shape = list(self.index['shape'])
+        expected_dtype = self.index['datatype']
+        for infer_input in request.inputs:
+            if infer_input.name() != expected_name:
+                raise AssertionError(
+                    f'infer() sent input {infer_input.name()!r}, recorded '
+                    f'input is {expected_name!r}')
+            if infer_input.datatype() != expected_dtype:
+                raise AssertionError(
+                    f'infer() sent datatype {infer_input.datatype()!r}, '
+                    f'recorded datatype is {expected_dtype!r}')
+            sent = list(infer_input.shape())
+            if sent[1:] != expected_shape[1:] or len(sent) != len(expected_shape):
+                raise AssertionError(
+                    f'infer() sent shape {sent}, recorded shape is '
+                    f'{expected_shape}')
+        for class_count in request.output_class_counts:
+            if class_count != entry['class_count']:
+                raise AssertionError(
+                    f'infer() requested class_count={class_count}, but '
+                    f'{self.response!r} was recorded with '
+                    f'class_count={entry["class_count"]}')
 
         message = service_pb2.ModelInferResponse()
-        message.ParseFromString(_read(path))
+        message.ParseFromString(
+            read_fixture(self.model, f'response_{self.response}.pb'))
         return tritonclient.grpc.InferResult(message)
 
     # -- convenience for tests ---------------------------------------------

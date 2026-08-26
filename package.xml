@@ -13,10 +13,13 @@
 
     <buildtool_depend>catkin</buildtool_depend>
 
-    <exec_depend>cv_bridge</exec_depend>
-    <exec_depend>rospy</exec_depend>
-    <exec_depend>sensor_msgs</exec_depend>
-
-    <depend>std_msgs</depend>
+    <depend>rospy</depend>
+    <depend>sensor_msgs</depend>
     <depend>vision_msgs</depend>
+
+    <exec_depend>cv_bridge</exec_depend>
+
+    <test_depend>python3-pytest</test_depend>
+    <test_depend>python3-numpy</test_depend>
+    <test_depend>python3-pil</test_depend>
 </package>

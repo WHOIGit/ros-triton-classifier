@@ -53,7 +53,12 @@ def load_class_labels():
     configured, which is legal -- consumers then only get numeric ids.
     '''
     labels = rospy.get_param('~class_labels', None)
-    if isinstance(labels, list):
+    if labels is not None:
+        # Fail fast on a mistyped parameter (a YAML string or dict) rather
+        # than silently behaving as if no labels were configured.
+        if not isinstance(labels, list):
+            raise ValueError('~class_labels must be a list of names, got %s'
+                             % type(labels).__name__)
         return [str(label) for label in labels]
 
     path = rospy.get_param('~class_labels_file', None)
@@ -66,23 +71,30 @@ def load_class_labels():
 
 def publish_class_labels(model_name, labels):
     '''
-    Put the id -> name map on the parameter server and return the fully
-    resolved parameter name, for VisionInfo.database_location.
+    Put the id -> name map on the parameter server and return the parameter
+    name for VisionInfo.database_location, plus an integer version for
+    VisionInfo.database_version, both derived from a hash of the model and
+    labels.
 
-    The name is keyed by a hash of the model and labels so that two nodes
-    serving different models cannot quietly overwrite each other's map.
+    The key is global rather than private: this node is anonymous, so a
+    private key would change every launch and each restart would leak another
+    copy of the map onto the parameter server forever. With a global,
+    digest-keyed name, restarts (and other nodes serving the same model and
+    labels) reuse one parameter, while different models cannot collide.
     '''
     digest = hashlib.sha1(
         ('\n'.join([model_name] + labels)).encode('utf-8')).hexdigest()[:8]
-    key = rospy.resolve_name('~class_labels_%s' % digest)
+    key = '/class_labels_%s' % digest
 
     # A dict keyed by str(id): ROS parameters are XML-RPC structs, so the keys
     # have to be strings even though the ids are numeric.
     rospy.set_param(key, {str(i): name for i, name in enumerate(labels)})
-    return key
+
+    # The digest doubles as a version, so consumers can notice label changes.
+    return key, int(digest, 16)
 
 
-def on_image(model, image_input, output_name, task, publisher, image_msg):
+def on_image(model, output_name, publisher, builder, image_msg):
     # Use the cv_bridge to convert to an OpenCV image object
     img = CvBridge().imgmsg_to_cv2(image_msg)
     # Convert the OpenCV image to a PIL image
@@ -96,14 +108,15 @@ def on_image(model, image_input, output_name, task, publisher, image_msg):
 
     results = getattr(result, output_name)
 
-    if task == 'detection':
-        publisher.publish(
-            build_detections(results, image_input, pil_image.size, image_msg))
-    else:
-        publisher.publish(build_classification(results, image_msg))
+    # A batching model returns one result list per batched input; we always
+    # send a single image, so unwrap our batch of one.
+    if model.can_batch:
+        results = results[0]
+
+    publisher.publish(builder(results, pil_image.size, image_msg))
 
 
-def build_detections(detections, image_input, source_size, image_msg):
+def build_detections(detections, source_size, image_msg, image_input):
     '''Convert triton_api Detections into a vision_msgs/Detection2DArray.'''
     array = Detection2DArray()
     array.header = image_msg.header
@@ -114,6 +127,12 @@ def build_detections(detections, image_input, source_size, image_msg):
         # source image so the boxes mean something to a consumer.
         x1, y1, x2, y2 = image_input.to_source_box((d.x1, d.y1, d.x2, d.y2),
                                                    source_size)
+
+        # A box lying entirely in the letterbox padding collapses to zero
+        # area when clipped to the source image; drop it rather than publish
+        # a phantom detection pinned to the image edge.
+        if x2 <= x1 or y2 <= y1:
+            continue
 
         detection = Detection2D()
         detection.header = image_msg.header
@@ -133,7 +152,7 @@ def build_detections(detections, image_input, source_size, image_msg):
     return array
 
 
-def build_classification(classifications, image_msg):
+def build_classification(classifications, source_size, image_msg):
     '''
     Convert triton_api Classifications into a vision_msgs/Classification2D.
 
@@ -170,18 +189,33 @@ def main():
     input_name = model.metadata.inputs[0].name
     output_name = model.metadata.outputs[0].name
 
+    layout = rospy.get_param('~layout', None)
+
+    # For models that declare dynamic spatial dimensions, whose input size
+    # the shape metadata cannot supply.
+    input_size = rospy.get_param('~input_size', None)
+    if input_size is not None:
+        if not isinstance(input_size, list) or len(input_size) != 2:
+            raise ValueError('~input_size must be [width, height], got %r'
+                             % (input_size,))
+        input_size = (int(input_size[0]), int(input_size[1]))
+
     labels = load_class_labels()
 
+    # The single task dispatch: everything that differs between the tasks is
+    # decided here, once, and on_image stays task-agnostic.
     if task == 'detection':
-        image_input = ImageInput(scaling=ScalingMode.NORM, letterbox=True,
-                                 layout=rospy.get_param('~layout', None))
+        image_input = ImageInput(scaling=ScalingMode.NORM, layout=layout,
+                                 size=input_size, letterbox=True)
         output = DetectionOutput(
             confidence=rospy.get_param('~confidence_threshold', 0.25),
             iou=rospy.get_param('~iou_threshold', 0.45),
             labels=labels or None)
+        topic_suffix, message_type = '/detections', Detection2DArray
+        builder = functools.partial(build_detections, image_input=image_input)
     else:
-        image_input = ImageInput(scaling=ScalingMode.INCEPTION,
-                                 layout=rospy.get_param('~layout', None))
+        image_input = ImageInput(scaling=ScalingMode.INCEPTION, layout=layout,
+                                 size=input_size)
         # Normalize locally by default so that `score` is a probability, as
         # vision_msgs expects. Set ~activation to '' for the server's raw
         # logits, or to 'sigmoid' for a multi-label model.
@@ -190,27 +224,26 @@ def main():
             classes=rospy.get_param('~classes', 3),
             activation=activation,
             labels=labels or None)
+        topic_suffix, message_type = '/classification', Classification2D
+        builder = build_classification
 
     setattr(model, input_name, image_input)
     setattr(model, output_name, output)
 
     image_topic = rospy.get_param('~image_topic')
-
-    if task == 'detection':
-        publisher = rospy.Publisher(image_topic + '/detections',
-                                    Detection2DArray, queue_size=1)
-    else:
-        publisher = rospy.Publisher(image_topic + '/classification',
-                                    Classification2D, queue_size=1)
+    publisher = rospy.Publisher(image_topic + topic_suffix, message_type,
+                                queue_size=1)
 
     # Advertise where the id -> name map lives. Latched, so that subscribers
     # which come up after us still receive it.
     info = VisionInfo()
     info.header.stamp = rospy.Time.now()
     info.method = model_name
-    info.database_location = publish_class_labels(model_name, labels) \
-        if labels else ''
-    info.database_version = 0
+    if labels:
+        info.database_location, info.database_version = \
+            publish_class_labels(model_name, labels)
+    else:
+        info.database_location, info.database_version = '', 0
 
     info_publisher = rospy.Publisher(image_topic + '/vision_info', VisionInfo,
                                      queue_size=1, latch=True)
@@ -219,6 +252,12 @@ def main():
     if not labels:
         rospy.logwarn('No ~class_labels or ~class_labels_file configured; '
                       'publishing numeric class ids only')
+        # vision_msgs cannot carry the per-result names Triton itself returns,
+        # so if the model brought its own labels, point the operator at them.
+        if any(o.label_filename for o in model.config.output):
+            rospy.logwarn(
+                'The model config names a label_filename; set ~class_labels '
+                'or ~class_labels_file to the same list to publish the names')
 
     # Subscribe to the raw image data. image_transport publishes the raw
     # sensor_msgs/Image on the base topic itself -- only the other transports
@@ -226,8 +265,7 @@ def main():
     rospy.Subscriber(
         image_topic,
         Image,
-        functools.partial(on_image, model, image_input, output_name, task,
-                          publisher)
+        functools.partial(on_image, model, output_name, publisher, builder)
     )
 
     rospy.spin()
