@@ -156,10 +156,10 @@ def build_classification(classifications, source_size, image_msg):
     '''
     Convert triton_api Classifications into a vision_msgs/Classification2D.
 
-    NOTE: vision_msgs says score "should lie in the range [0-1]", but Triton
-    applies no activation, so these are raw logits. They cannot be normalized
-    correctly here because class_count only returns the top N of them -- see
-    issue #5.
+    vision_msgs says score "should lie in the range [0-1]". The node asks
+    ClassificationOutput to apply a softmax over the model's complete logit
+    vector by default, so that holds; with ~activation='' the scores are the
+    server's raw logits instead and it does not.
     '''
     message = Classification2D()
     message.header = image_msg.header
@@ -216,8 +216,14 @@ def main():
     else:
         image_input = ImageInput(scaling=ScalingMode.INCEPTION, layout=layout,
                                  size=input_size)
+        # Normalize locally by default so that `score` is a probability, as
+        # vision_msgs expects. Set ~activation to '' for the server's raw
+        # logits, or to 'sigmoid' for a multi-label model.
+        activation = rospy.get_param('~activation', 'softmax') or None
         output = ClassificationOutput(
-            classes=rospy.get_param('~classes', 3))
+            classes=rospy.get_param('~classes', 3),
+            activation=activation,
+            labels=labels or None)
         topic_suffix, message_type = '/classification', Classification2D
         builder = build_classification
 
