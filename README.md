@@ -13,3 +13,9 @@ The message definitions are similar to [`vision_msgs`][vision_msgs] but it does 
 Please install the `tritonclient[all]` Python package:
 
     python3 -m pip install tritonclient[all]
+
+This client uses the gRPC transport only. On Jetson (JetPack 5.1.x / aarch64,
+Python 3.8) the `[all]` and `[http]` extras fail to build because they pull in
+`gevent`, which has no aarch64 wheel; install just the gRPC client there:
+
+    python3 -m pip install tritonclient[grpc]
