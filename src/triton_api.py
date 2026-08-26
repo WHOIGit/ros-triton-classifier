@@ -31,9 +31,11 @@ def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
     '''
     Convert a *complete* vector of logits into probabilities.
 
-    Triton does not apply an activation function to model outputs. Apply this to
-    the full output tensor (bind the output as a TensorOutput); applying it to
-    the truncated top-N scores from ClassificationOutput gives wrong answers.
+    Most callers do not need this directly: pass activation='softmax' to
+    ClassificationOutput and it normalizes the full logit vector for you.
+    If you do call it, apply it only to a complete tensor (e.g. from a
+    TensorOutput); softmaxing a truncated top-N -- or scores that were
+    already activated -- gives wrong answers.
     '''
     shifted = logits - np.max(logits, axis=axis, keepdims=True)
     exp = np.exp(shifted)
@@ -77,8 +79,10 @@ class Classification(NamedTuple):
     A single possible classification result for an input. Multiple of these
     Classification objects may be returned.
 
-    Note that the score is a "raw" value, not a percentage; apply softmax or
-    a similar function for that.
+    What `score` means depends on how it was produced: with an activation
+    configured on ClassificationOutput it is already a probability in [0, 1]
+    (do NOT softmax it again); with activation=None it is the server's raw
+    logit.
     '''
     score: float
     class_id: int
@@ -409,6 +413,8 @@ class ModelOutput:
         self.config: model_config_pb2.ModelOutput = None  # type: ignore
         self.metadata: service_pb2.ModelMetadataResponse.TensorMetadata = \
             None  # type: ignore
+        # Optional id -> name list, set by subclasses that take `labels`.
+        self.labels: List[str] = None  # type: ignore
 
     def bind(self, model: 'Model', name: str):
         '''
@@ -438,6 +444,45 @@ class ModelOutput:
         ClassificationOutput overrides this.
         '''
         return 0
+
+    def _class_name(self, class_id: int) -> str:
+        '''
+        Name a class from the `labels` list. Out-of-range ids (or no labels
+        at all) fall back to the numeric id as a string, so the field is
+        never silently empty.
+        '''
+        if self.labels is not None and 0 <= class_id < len(self.labels):
+            return self.labels[class_id]
+        return str(class_id)
+
+    def _per_input(self, value: np.ndarray, rank: int, what: str):
+        '''
+        Split a raw output tensor into per-input pieces of the given rank:
+        a list of arrays for a batching model, a single bare array otherwise.
+
+        Only a batching model's leading axis is a batch; for a non-batching
+        model a leading 1 belongs to the model's own output shape. Trailing
+        singleton axes (the [N, C, 1, 1] shape of some pooled classifier
+        heads) carry no information and are squeezed away first.
+        '''
+        expected = rank + (1 if self.model.can_batch else 0)
+        while value.ndim > expected and value.shape[-1] == 1:
+            value = value[..., 0]
+
+        if self.model.can_batch:
+            if value.ndim != expected:
+                raise ValueError(
+                    f'Expected {expected} dimensions for a batched {what}, '
+                    f'got {tuple(value.shape)}')
+            return list(value)
+
+        if value.ndim == rank + 1 and value.shape[0] == 1:
+            value = value[0]
+        if value.ndim != rank:
+            raise ValueError(
+                f'Expected a {rank}-dimensional {what}, '
+                f'got {tuple(value.shape)}')
+        return value
 
     def process(self, value: np.ndarray) -> Any:
         '''
@@ -506,23 +551,29 @@ class ClassificationOutput(ModelOutput):
         # activation is only correct over the complete set of logits.
         return 0 if self.activation else self.classes
 
-    def _class_name(self, class_id: int) -> str:
-        if self.labels is not None and 0 <= class_id < len(self.labels):
-            return self.labels[class_id]
-        return ''
-
     def _activate(self, logits: np.ndarray) -> np.ndarray:
         if self.activation == 'softmax':
             return softmax(logits, axis=-1)
         # sigmoid, computed in a form that does not overflow for large |x|
-        return np.where(logits >= 0,
-                        1.0 / (1.0 + np.exp(-np.abs(logits))),
-                        np.exp(-np.abs(logits)) / (1.0 + np.exp(-np.abs(logits))))
+        e = np.exp(-np.abs(logits))
+        return np.where(logits >= 0, 1.0, e) / (1.0 + e)
 
     def _top_classes(self, logits: np.ndarray) -> List[Classification]:
         '''Normalize a full logit vector, then take the top `classes` of it.'''
-        scores = self._activate(np.asarray(logits, dtype=np.float64))
-        ranking = np.argsort(scores)[::-1][:self.classes]
+        logits = np.asarray(logits, dtype=np.float64)
+        if not np.all(np.isfinite(logits)):
+            # A NaN -- or an inf, which softmax's max-shift turns into NaN --
+            # sorts ahead of every real value and would be published as the
+            # top score. Fail loudly instead.
+            raise ValueError('Model returned non-finite logits')
+
+        # Rank on the raw logits, which both activations preserve
+        # monotonically. The activated scores saturate (float64 sigmoid is
+        # exactly 1.0 past |x| ~ 37) and would tie in arbitrary order; a
+        # stable sort on the logits keeps genuine ties in ascending-id order,
+        # matching the server-side ranking.
+        ranking = np.argsort(-logits, kind='stable')[:self.classes]
+        scores = self._activate(logits)
         return [
             Classification(score=float(scores[i]), class_id=int(i),
                            class_name=self._class_name(int(i)))
@@ -539,13 +590,18 @@ class ClassificationOutput(ModelOutput):
         '''
         fields = c.decode().split(':', maxsplit=2)
         if len(fields) == 2:
-            # Tolerated, but worth one loud note: without label_filename in the
-            # model config every published class_name will be empty.
-            warnings.warn(
-                'Triton returned classifications without class names; the '
-                'model config likely does not set label_filename',
-                stacklevel=2)
-            (score, class_id), class_name = fields, ''
+            # No server-side name (the model config has no label_filename);
+            # fall back to caller-supplied labels so they are honored in this
+            # mode too, and warn once when there is nothing to fall back on.
+            score, class_id = fields
+            if self.labels is not None:
+                class_name = self._class_name(int(class_id))
+            else:
+                warnings.warn(
+                    'Triton returned classifications without class names; '
+                    'the model config likely does not set label_filename',
+                    stacklevel=2)
+                class_name = ''
         elif len(fields) == 3:
             score, class_id, class_name = fields
         else:
@@ -562,17 +618,9 @@ class ClassificationOutput(ModelOutput):
 
         if self.activation:
             # A full logit vector per input, so rank locally.
-            if self.model.can_batch:
-                if value.ndim != 2:
-                    raise ValueError(
-                        'Expected 2 dimensions for a batched output')
+            value = self._per_input(value, 1, 'logit vector')
+            if isinstance(value, list):
                 return [self._top_classes(row) for row in value]
-
-            # A leading 1 here belongs to the model's own output shape.
-            if value.ndim == 2 and value.shape[0] == 1:
-                value = value[0]
-            if value.ndim != 1:
-                raise ValueError('Expected a 1-dimensional logit vector')
             return self._top_classes(value)
 
         # Triton already picked the top N and encoded them as strings.
@@ -614,11 +662,6 @@ class DetectionOutput(ModelOutput):
         self.confidence = confidence
         self.iou = iou
         self.labels = labels
-
-    def _class_name(self, class_id: int) -> str:
-        if self.labels is not None and 0 <= class_id < len(self.labels):
-            return self.labels[class_id]
-        return str(class_id)
 
     @staticmethod
     def _nms(boxes: np.ndarray, scores: np.ndarray, iou: float) -> List[int]:
@@ -743,17 +786,9 @@ class DetectionOutput(ModelOutput):
     def process(self, value: np.ndarray) \
             -> Union[List[List[Detection]], List[Detection]]:
 
-        # Only a batching model's leading axis is a batch; for a non-batching
-        # model a leading 1 belongs to the model's own output shape.
-        if self.model.can_batch:
-            if value.ndim != 3:
-                raise ValueError('Expected 3 dimensions for a batched output')
+        value = self._per_input(value, 2, 'detection output')
+        if isinstance(value, list):
             return [self._process_one(a) for a in value]
-
-        if value.ndim == 3 and value.shape[0] == 1:
-            value = value[0]
-        if value.ndim != 2:
-            raise ValueError('Expected a 2-dimensional detection output')
         return self._process_one(value)
 
 
@@ -975,6 +1010,13 @@ def main():
     mode.add_argument('--raw', action='store_true',
                       help='return the raw output tensor without parsing')
 
+    parser.add_argument('--activation', choices=['softmax', 'sigmoid', 'none'],
+                        default='softmax',
+                        help='classification score normalization; the default '
+                             "matches the ROS node's ~activation, so this "
+                             "tool reproduces the node's published scores "
+                             "('none' prints the server's raw logits)")
+
     parser.add_argument('images', nargs='+')
     args = parser.parse_args()
 
@@ -1001,7 +1043,8 @@ def main():
         setattr(model, out_name, DetectionOutput())
     else:
         setattr(model, out_name, ClassificationOutput(
-            classes=args.classes if args.classes is not None else 3))
+            classes=args.classes if args.classes is not None else 3,
+            activation=None if args.activation == 'none' else args.activation))
 
     images = [Image.open(path) for path in args.images]
 

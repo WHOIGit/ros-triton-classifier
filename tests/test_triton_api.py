@@ -392,6 +392,45 @@ def test_activation_labels_name_the_classes():
         assert c.class_name == f'digit-{c.class_id}'
 
 
+def test_activation_rejects_non_finite_logits():
+    '''NaN (or inf, which softmax turns into NaN) must not rank first.'''
+    output = triton_api.ClassificationOutput(classes=3, activation='softmax')
+    with pytest.raises(ValueError, match='non-finite'):
+        output._top_classes(np.array([1.0, np.nan, 2.0]))
+    with pytest.raises(ValueError, match='non-finite'):
+        output._top_classes(np.array([1.0, np.inf, 2.0]))
+
+
+def test_saturated_sigmoid_still_ranks_by_logit():
+    '''Logits 50 and 40 both sigmoid to exactly 1.0; ranking must not tie.'''
+    output = triton_api.ClassificationOutput(classes=2, activation='sigmoid')
+    logits = np.zeros(100)
+    logits[3], logits[7] = 50.0, 40.0
+    top = output._top_classes(logits)
+    assert [c.class_id for c in top] == [3, 7]
+    assert top[0].score == top[1].score == 1.0
+
+
+def test_activation_accepts_trailing_singleton_axes():
+    '''Pooled classifier heads emit [1, C, 1, 1]; the squeeze must cope.'''
+    model, _ = make_model('mnist', response='gradient')
+    model.Input3 = triton_api.ImageInput(layout='NCHW')
+    model.Plus214_Output_0 = triton_api.ClassificationOutput(
+        classes=3, activation='softmax')
+
+    logits = np.arange(10, dtype=np.float32).reshape(1, 10, 1, 1)
+    results = model.Plus214_Output_0.process(logits)
+    assert [c.class_id for c in results] == [9, 8, 7]
+
+
+def test_labels_also_name_classes_in_server_top_n_mode():
+    '''labels= must not be silently inert when activation is None.'''
+    digits = [f'digit-{i}' for i in range(10)]
+    output = triton_api.ClassificationOutput(classes=3, labels=digits)
+    parsed = output._parse_classification(b'6.365949:5')
+    assert parsed.class_name == 'digit-5'
+
+
 def test_rejects_an_unknown_activation():
     with pytest.raises(ValueError, match='activation must be one of'):
         triton_api.ClassificationOutput(classes=3, activation='relu')
