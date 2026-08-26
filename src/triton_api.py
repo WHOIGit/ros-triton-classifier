@@ -15,6 +15,7 @@ processing of their inptus and outputs, like image classification models:
 
 import enum
 import functools
+import warnings
 
 from typing import Any, List, NamedTuple, Union, cast
 
@@ -23,6 +24,7 @@ import tritonclient.grpc
 
 from PIL import Image
 from tritonclient.grpc import model_config_pb2, service_pb2
+from tritonclient.utils import triton_to_np_dtype
 
 
 def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -38,20 +40,23 @@ def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
     return exp / np.sum(exp, axis=axis, keepdims=True)
 
 
-def model_dtype_to_np(model_dtype: str) -> object:
-    return {
-        'BOOL':   bool,
-        'INT8':   np.int8,
-        'INT16':  np.int16,
-        'INT32':  np.int32,
-        'INT64':  np.int64,
-        'UINT8':  np.uint8,
-        'UINT16': np.uint16,
-        'FP16':   np.float16,
-        'FP32':   np.float32,
-        'FP64':   np.float64,
-        'BYTES':  np.dtype(object),
-    }[model_dtype]
+def model_dtype_to_np(model_dtype: str) -> np.dtype:
+    # tritonclient ships the full Triton -> numpy mapping (including UINT32,
+    # UINT64, and BF16, which a hand-rolled table here used to omit).
+    np_dtype = triton_to_np_dtype(model_dtype)
+    if np_dtype is None:
+        raise ValueError(f'Unsupported model datatype {model_dtype!r}')
+    return np.dtype(np_dtype)
+
+
+def shape_matches(actual, expected) -> bool:
+    '''
+    Compare a concrete tensor shape against a model-declared one, where -1
+    marks a dimension the model leaves dynamic (any size satisfies it).
+    '''
+    actual, expected = list(actual), list(expected)
+    return len(actual) == len(expected) and \
+        all(e == -1 or a == e for a, e in zip(actual, expected))
 
 
 class ScalingMode(enum.Enum):
@@ -145,8 +150,12 @@ class ModelInput:
 
 class TensorInput(ModelInput):
     def process(self, value: np.ndarray) -> np.ndarray:
-        # If we received a single input and expected a batch, reshape
-        if self.model.can_batch and len(self.metadata.shape) == value.ndim + 1:
+        # If we received a single input and the tensor carries a batch axis --
+        # either implicitly (max_batch_size > 0) or an explicit dynamic leading
+        # dimension -- reshape into a batch of one.
+        shape = self.metadata.shape
+        if len(shape) == value.ndim + 1 and \
+                (self.model.can_batch or shape[0] == -1):
             return value.reshape([1] + list(value.shape))
 
         # Otherwise, pass through unmodified
@@ -154,10 +163,12 @@ class TensorInput(ModelInput):
 
 
 class ImageInput(ModelInput):
+    # `letterbox` is keyword-only so the pre-existing positional order
+    # (scaling, layout, size) stays stable for callers.
     def __init__(self, scaling: ScalingMode = ScalingMode.NONE,
                  layout: str = None,  # type: ignore[assignment]
-                 letterbox: bool = False,
-                 size: tuple = None):  # type: ignore[assignment]
+                 size: tuple = None,  # type: ignore[assignment]
+                 *, letterbox: bool = False):
         super().__init__()
         self.scaling = scaling
         # Preserve aspect ratio by scaling to fit and padding the remainder,
@@ -209,10 +220,21 @@ class ImageInput(ModelInput):
         else:  # NHWC
             self.height, self.width, self.channels = shape[-3], shape[-2], shape[-1]
 
-        # Triton reports -1 for any dimension the model leaves dynamic, which is
-        # not a usable image size. Fall back to an explicit size= if given.
+        # Triton reports -1 for any dimension the model leaves dynamic, which
+        # is not a usable image size. Fall back to an explicit size= for those
+        # dimensions only; a size= that contradicts a fixed declared dimension
+        # is a configuration error, not an override.
         if self.size is not None:
-            self.width, self.height = self.size
+            want_w, want_h = self.size
+            if (self.width > 0 and self.width != want_w) or \
+                    (self.height > 0 and self.height != want_h):
+                raise ValueError(
+                    f'size={self.size} contradicts the model-declared input '
+                    f'size ({self.width}, {self.height})')
+            if self.width < 1:
+                self.width = want_w
+            if self.height < 1:
+                self.height = want_h
         if self.width < 1 or self.height < 1:
             raise ValueError(
                 f'Model declares dynamic spatial dimensions {shape}; pass '
@@ -221,6 +243,27 @@ class ImageInput(ModelInput):
             raise ValueError(
                 f'Model declares a dynamic channel count in {shape}; '
                 'ImageInput needs a fixed 1- or 3-channel input')
+
+        # How many images one request may carry: the model either batches via
+        # max_batch_size (Triton adds the axis itself), or declares an explicit
+        # leading batch dimension of its own (-1 for unbounded, or a fixed
+        # count). None means unbounded.
+        if model.can_batch:
+            self._capacity = model.max_batch_size
+        elif self._rank == 4:
+            self._capacity = shape[0] if shape[0] > 0 else None
+        else:
+            self._capacity = 1
+
+        # Resolve the tensor dtype once, and catch a scaling mode bound to an
+        # integer tensor here rather than on the first frame: scaling produces
+        # fractional values, so it is only meaningful for a float tensor.
+        self.dtype = model_dtype_to_np(self.metadata.datatype)
+        if self.scaling != ScalingMode.NONE and \
+                not np.issubdtype(self.dtype, np.floating):
+            raise ValueError(
+                f'{self.scaling.name} scaling requires a floating-point input '
+                f'tensor, but the model expects {self.metadata.datatype}')
 
     def _process_one(self, image: Image.Image) -> np.ndarray:
         # Convert the image to the model's expected channel count
@@ -238,16 +281,9 @@ class ImageInput(ModelInput):
         else:
             image = image.resize((self.width, self.height), Image.BILINEAR)
 
-        # Convert the image to a nparray. Scaling produces fractional values, so
-        # it is only meaningful for a float input tensor; catch an integer one
-        # here rather than letting numpy raise an opaque casting error below.
-        dtype = np.dtype(model_dtype_to_np(self.metadata.datatype))
-        if self.scaling != ScalingMode.NONE and not np.issubdtype(dtype,
-                                                                  np.floating):
-            raise ValueError(
-                f'{self.scaling.name} scaling requires a floating-point input '
-                f'tensor, but the model expects {self.metadata.datatype}')
-        array = np.array(image).astype(dtype)
+        # Convert the image to an ndarray, casting straight into the model's
+        # dtype (resolved once at bind time) in a single pass.
+        array = np.array(image, dtype=self.dtype)
 
         # If the image is grayscale, add a channel axis (HW -> HWC)
         if array.ndim == 2:
@@ -265,6 +301,20 @@ class ImageInput(ModelInput):
             raise NotImplementedError('Scaling mode is not implemented yet')
 
         return array
+
+    def _letterbox_geometry(self, source_size: tuple) -> tuple:
+        '''
+        The single definition of where a letterboxed source image lands in
+        the input frame: the resized (width, height) and the top-left pad
+        offsets. Both _letterbox and source_mapping derive from this, so the
+        forward transform and its inverse cannot drift apart.
+        '''
+        source_width, source_height = source_size
+        scale = min(self.width / source_width, self.height / source_height)
+        new_width = max(1, round(source_width * scale))
+        new_height = max(1, round(source_height * scale))
+        return (new_width, new_height,
+                (self.width - new_width) // 2, (self.height - new_height) // 2)
 
     def source_mapping(self, source_size: tuple) -> tuple:
         '''
@@ -284,11 +334,14 @@ class ImageInput(ModelInput):
             return (self.width / source_width, self.height / source_height,
                     0.0, 0.0)
 
-        scale = min(self.width / source_width, self.height / source_height)
-        new_width = max(1, round(source_width * scale))
-        new_height = max(1, round(source_height * scale))
-        return (scale, scale,
-                (self.width - new_width) // 2, (self.height - new_height) // 2)
+        # The effective per-axis scale is the ratio of the *rounded* resize
+        # to the source -- not the ideal min() ratio -- otherwise inverting
+        # the mapping drifts by up to a pixel in the input frame (and several
+        # pixels in a large source image).
+        new_width, new_height, pad_x, pad_y = \
+            self._letterbox_geometry(source_size)
+        return (new_width / source_width, new_height / source_height,
+                pad_x, pad_y)
 
     def to_source_box(self, box: tuple, source_size: tuple) -> tuple:
         '''
@@ -305,20 +358,21 @@ class ImageInput(ModelInput):
             min(max((y2 - pad_y) / scale_y, 0.0), source_height),
         )
 
-    def _letterbox(self, image: Image.Image, fill: int = 114) -> Image.Image:
+    # The 114-gray fill matches the Ultralytics letterbox convention.
+    LETTERBOX_FILL = 114
+
+    def _letterbox(self, image: Image.Image) -> Image.Image:
         '''
         Resize preserving aspect ratio, centered on a constant-filled canvas of
         the model's input size. This matches how detection models are trained.
         '''
-        scale = min(self.width / image.width, self.height / image.height)
-        new_size = (max(1, round(image.width * scale)),
-                    max(1, round(image.height * scale)))
-        resized = image.resize(new_size, Image.BILINEAR)
+        new_width, new_height, pad_x, pad_y = \
+            self._letterbox_geometry((image.width, image.height))
+        resized = image.resize((new_width, new_height), Image.BILINEAR)
 
-        background = fill if image.mode == 'L' else (fill,) * len(image.getbands())
+        background = (self.LETTERBOX_FILL,) * len(image.getbands())
         canvas = Image.new(image.mode, (self.width, self.height), background)
-        canvas.paste(resized, ((self.width - new_size[0]) // 2,
-                               (self.height - new_size[1]) // 2))
+        canvas.paste(resized, (pad_x, pad_y))
         return canvas
 
     def process(self, value: Union[Image.Image, List[Image.Image]]) \
@@ -330,8 +384,9 @@ class ImageInput(ModelInput):
             value = [value]
         value = cast(List[Image.Image], value)
 
-        if not self.model.can_batch and len(value) != 1:
-            raise ValueError('Input expects exactly one image')
+        if self._capacity is not None and len(value) > self._capacity:
+            raise ValueError(
+                f'Model accepts at most {self._capacity} image(s) per request')
 
         # Process all of the images into a batch in NHWC format
         processed = np.stack([self._process_one(image) for image in value])
@@ -418,6 +473,12 @@ class ClassificationOutput(ModelOutput):
         '''
         fields = c.decode().split(':', maxsplit=2)
         if len(fields) == 2:
+            # Tolerated, but worth one loud note: without label_filename in the
+            # model config every published class_name will be empty.
+            warnings.warn(
+                'Triton returned classifications without class names; the '
+                'model config likely does not set label_filename',
+                stacklevel=2)
             (score, class_id), class_name = fields, ''
         elif len(fields) == 3:
             score, class_id, class_name = fields
@@ -453,9 +514,17 @@ class DetectionOutput(ModelOutput):
     Expects a tensor shaped (4 + num_classes, num_anchors) -- optionally with a
     leading batch axis -- where the first four rows are the box center x, center
     y, width, and height in input-image pixels, as exported by Ultralytics
-    YOLOv8/v11. Box coordinates are relative to the model's input size; if the
-    image was letterboxed, map them back yourself using the same scale/padding.
+    YOLOv8/v11. YOLOv5/v7-style exports that carry an extra objectness row
+    (4 + 1 + num_classes) are NOT understood; pass `labels` so the class count
+    can be checked, which turns that silent mis-decode into an error and also
+    resolves the tensor orientation authoritatively. Box coordinates are
+    relative to the model's input size; if the image was letterboxed, map them
+    back yourself using the same scale/padding.
     '''
+
+    # Upper bound on candidates entering NMS, like Ultralytics' max_det: keeps
+    # the greedy loop bounded on cluttered frames.
+    MAX_CANDIDATES = 300
 
     def __init__(self, confidence: float = 0.25, iou: float = 0.45,
                  labels: List[str] = None):  # type: ignore[assignment]
@@ -480,8 +549,6 @@ class DetectionOutput(ModelOutput):
         while order.size > 0:
             best = order[0]
             keep.append(int(best))
-            if order.size == 1:
-                break
             rest = order[1:]
 
             # Intersection of the best box with every remaining box
@@ -499,48 +566,96 @@ class DetectionOutput(ModelOutput):
 
         return keep
 
+    def _oriented(self, predictions: np.ndarray) -> np.ndarray:
+        '''
+        Return the output as (4 + num_classes, num_anchors). Exporters disagree
+        about the axis order; with `labels` the class count identifies the
+        right axis authoritatively, otherwise fall back to the heuristic that
+        anchors vastly outnumber the 4+nc rows.
+        '''
+        r, c = predictions.shape
+
+        if self.labels is not None:
+            rows = 4 + len(self.labels)
+            if (r == rows) != (c == rows):
+                return predictions if r == rows else predictions.T
+            if r != rows and c != rows:
+                raise ValueError(
+                    f'Neither axis of the {predictions.shape} output matches '
+                    f'4 + {len(self.labels)} labels; a YOLOv5/v7-style export '
+                    'with an objectness row (4+1+nc) is not supported')
+            # Both axes match (square): fall through to the shape heuristic,
+            # which cannot decide either.
+
+        if r == c:
+            raise ValueError(
+                f'Cannot infer the orientation of a square '
+                f'{predictions.shape} detection output; pass labels= so the '
+                'class count disambiguates it')
+        return predictions.T if r > c else predictions
+
     def _process_one(self, predictions: np.ndarray) -> List[Detection]:
-        # Accept either (4+nc, anchors) or its transpose, since exporters
-        # disagree; anchors always vastly outnumber the 4+nc rows.
-        if predictions.shape[0] > predictions.shape[1]:
-            predictions = predictions.T
-        boxes, scores = predictions[:4].T, predictions[4:].T
+        predictions = self._oriented(predictions)
+        if predictions.shape[0] <= 4:
+            raise ValueError(
+                f'Expected a (4 + num_classes, num_anchors) tensor, got '
+                f'{predictions.shape}: a box-only output has no class scores')
 
-        class_ids = np.argmax(scores, axis=1)
-        confidences = scores[np.arange(scores.shape[0]), class_ids]
+        boxes, scores = predictions[:4].T, predictions[4:]
 
-        selected = confidences >= self.confidence
+        # Reduce over the class axis first and filter before the (expensive)
+        # argmax, which then only runs over the surviving anchors.
+        confidences = scores.max(axis=0)
+        selected = np.flatnonzero(confidences >= self.confidence)
+        if selected.size > self.MAX_CANDIDATES:
+            top = np.argpartition(confidences[selected],
+                                  -self.MAX_CANDIDATES)[-self.MAX_CANDIDATES:]
+            selected = selected[top]
+
         boxes = boxes[selected]
-        class_ids = class_ids[selected]
         confidences = confidences[selected]
+        class_ids = np.argmax(scores[:, selected], axis=0)
+
+        if selected.size == 0:
+            return []
 
         # Convert center-form xywh to corner-form xyxy for NMS, and clip to the
-        # input bounds -- the head can predict boxes that run off the edge.
-        centers, sizes = boxes[:, :2], boxes[:, 2:4]
-        corners = np.concatenate([centers - sizes / 2, centers + sizes / 2],
-                                 axis=1)
-        image_input = getattr(self.model, self.model.metadata.inputs[0].name)
-        width = getattr(image_input, 'width', 0)
-        height = getattr(image_input, 'height', 0)
-        if width > 0 and height > 0:
-            corners[:, [0, 2]] = corners[:, [0, 2]].clip(0, width)
-            corners[:, [1, 3]] = corners[:, [1, 3]].clip(0, height)
+        # input bounds -- the head can predict boxes that run off the edge. The
+        # bounds come from whichever input is a bound ImageInput; when nothing
+        # exposes a size (e.g. a TensorInput fed preprocessed arrays) we cannot
+        # clip, and say so once rather than silently skipping.
+        centers, half = boxes[:, :2], boxes[:, 2:4] * 0.5
+        corners = np.concatenate([centers - half, centers + half], axis=1)
+        image_input = next(
+            (obj for m in self.model.metadata.inputs
+             if isinstance(obj := getattr(self.model, m.name), ImageInput)),
+            None)
+        if image_input is not None:
+            np.clip(corners[:, 0::2], 0, image_input.width,
+                    out=corners[:, 0::2])
+            np.clip(corners[:, 1::2], 0, image_input.height,
+                    out=corners[:, 1::2])
+        else:
+            warnings.warn('No ImageInput is bound, so detection boxes are not '
+                          'clipped to the input bounds', stacklevel=2)
+
+        # Per-class suppression via the offset trick: shift each class's boxes
+        # into a disjoint coordinate region so a single NMS pass can never
+        # suppress across classes. Any offset wider than the coordinate span
+        # works. _nms returns indices best-first, so the result is sorted.
+        offset = float(corners.max() - min(corners.min(), 0.0)) + 1.0
+        shifted = corners + (class_ids * offset)[:, None]
 
         detections = []
-        for class_id in np.unique(class_ids):
-            members = np.nonzero(class_ids == class_id)[0]
-            for index in self._nms(corners[members], confidences[members],
-                                   self.iou):
-                which = members[index]
-                x1, y1, x2, y2 = corners[which]
-                detections.append(Detection(
-                    score=float(confidences[which]),
-                    class_id=int(class_id),
-                    class_name=self._class_name(int(class_id)),
-                    x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
-                ))
-
-        detections.sort(key=lambda d: d.score, reverse=True)
+        for index in self._nms(shifted, confidences, self.iou):
+            x1, y1, x2, y2 = corners[index]
+            class_id = int(class_ids[index])
+            detections.append(Detection(
+                score=float(confidences[index]),
+                class_id=class_id,
+                class_name=self._class_name(class_id),
+                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+            ))
         return detections
 
     def process(self, value: np.ndarray) \
@@ -666,21 +781,23 @@ class Model:
             result = kwargs[key] = inputobj.process(value)
             assert isinstance(result, np.ndarray)
 
-            # After processing, assert that each ndarray's shape matches the
-            # model's expected shape.
+            # After processing, check that each ndarray's shape matches the
+            # model's declared shape (shape_matches treats -1 as a wildcard).
+            # A real raise, not an assert: this must survive `python -O`.
             if self.can_batch:
-                assert result.shape[1:] == tuple(inputobj.metadata.shape[1:])
+                if not shape_matches(result.shape[1:],
+                                     inputobj.metadata.shape[1:]):
+                    raise ValueError(
+                        f'processed input shape {list(result.shape)} does not '
+                        f'match model shape '
+                        f'[batch, {", ".join(map(str, inputobj.metadata.shape[1:]))}]')
                 if result.shape[0] > self.max_batch_size:
                     raise ValueError('Too many inputs in batch')
             else:
-                # -1 marks a dimension the model leaves dynamic, which any
-                # size satisfies.
-                actual, expected = \
-                    list(result.shape), list(inputobj.metadata.shape)
-                assert len(actual) == len(expected) and \
-                    all(e == -1 or a == e for a, e in zip(actual, expected)), \
-                    (f'processed input shape {actual} does not '
-                     f'match model shape {expected}')
+                if not shape_matches(result.shape, inputobj.metadata.shape):
+                    raise ValueError(
+                        f'processed input shape {list(result.shape)} does not '
+                        f'match model shape {list(inputobj.metadata.shape)}')
 
             # Create the InferInput object for this input
             req_inputs.append(tritonclient.grpc.InferInput(
@@ -760,6 +877,10 @@ def main():
     parser.add_argument('--letterbox', action='store_true',
                         help='preserve aspect ratio by padding instead of '
                              'stretching (detection models expect this)')
+    parser.add_argument('-s', '--size', type=int, nargs=2, default=None,
+                        metavar=('WIDTH', 'HEIGHT'),
+                        help='input size for models that declare dynamic '
+                             'spatial dimensions')
     parser.add_argument('-u', '--url', default='localhost:8001')
 
     # How to interpret the output tensor. These are mutually exclusive so that
@@ -775,6 +896,11 @@ def main():
     parser.add_argument('images', nargs='+')
     args = parser.parse_args()
 
+    # Detection models are trained on letterboxed input; a stretched image
+    # silently shifts every predicted box, so --detect implies --letterbox.
+    if args.detect:
+        args.letterbox = True
+
     model = initialize_model(args.url, args.model_name, args.verbose,
                              args.model_version)
 
@@ -785,7 +911,8 @@ def main():
 
     setattr(model, in_name, ImageInput(
         scaling=ScalingMode[args.image_transform], layout=args.layout,
-        letterbox=args.letterbox))
+        letterbox=args.letterbox,
+        size=tuple(args.size) if args.size else None))
     if args.raw:
         setattr(model, out_name, TensorOutput())
     elif args.detect:
@@ -812,8 +939,12 @@ def main():
         value = getattr(result, out_name)
         if args.raw:
             arr = np.asarray(value)
-            print(f'{out_name}: shape={arr.shape} dtype={arr.dtype} '
-                  f'min={float(arr.min()):.4f} max={float(arr.max()):.4f}')
+            # min/max only exist for a non-empty numeric tensor (a detector
+            # may legitimately return zero rows, or a BYTES output).
+            stats = ''
+            if arr.size and np.issubdtype(arr.dtype, np.number):
+                stats = f' min={float(arr.min()):.4f} max={float(arr.max()):.4f}'
+            print(f'{out_name}: shape={arr.shape} dtype={arr.dtype}{stats}')
         else:
             pprint.pprint(value)
     stop = time.perf_counter()
