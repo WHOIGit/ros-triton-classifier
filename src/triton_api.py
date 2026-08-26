@@ -302,6 +302,62 @@ class ImageInput(ModelInput):
 
         return array
 
+    def _letterbox_geometry(self, source_size: tuple) -> tuple:
+        '''
+        The single definition of where a letterboxed source image lands in
+        the input frame: the resized (width, height) and the top-left pad
+        offsets. Both _letterbox and source_mapping derive from this, so the
+        forward transform and its inverse cannot drift apart.
+        '''
+        source_width, source_height = source_size
+        scale = min(self.width / source_width, self.height / source_height)
+        new_width = max(1, round(source_width * scale))
+        new_height = max(1, round(source_height * scale))
+        return (new_width, new_height,
+                (self.width - new_width) // 2, (self.height - new_height) // 2)
+
+    def source_mapping(self, source_size: tuple) -> tuple:
+        '''
+        Describe how a source image of ``source_size`` = (width, height) is
+        placed into the model's input frame.
+
+        Returns ``(scale_x, scale_y, pad_x, pad_y)`` such that
+
+            input_x = source_x * scale_x + pad_x
+            input_y = source_y * scale_y + pad_y
+
+        Detection coordinates come back in the model's input frame, so this is
+        what you need to put them back on the original image.
+        '''
+        source_width, source_height = source_size
+        if not self.letterbox:
+            return (self.width / source_width, self.height / source_height,
+                    0.0, 0.0)
+
+        # The effective per-axis scale is the ratio of the *rounded* resize
+        # to the source -- not the ideal min() ratio -- otherwise inverting
+        # the mapping drifts by up to a pixel in the input frame (and several
+        # pixels in a large source image).
+        new_width, new_height, pad_x, pad_y = \
+            self._letterbox_geometry(source_size)
+        return (new_width / source_width, new_height / source_height,
+                pad_x, pad_y)
+
+    def to_source_box(self, box: tuple, source_size: tuple) -> tuple:
+        '''
+        Map an (x1, y1, x2, y2) box from the model's input frame back onto a
+        source image of ``source_size``, clipped to that image.
+        '''
+        scale_x, scale_y, pad_x, pad_y = self.source_mapping(source_size)
+        x1, y1, x2, y2 = box
+        source_width, source_height = source_size
+        return (
+            min(max((x1 - pad_x) / scale_x, 0.0), source_width),
+            min(max((y1 - pad_y) / scale_y, 0.0), source_height),
+            min(max((x2 - pad_x) / scale_x, 0.0), source_width),
+            min(max((y2 - pad_y) / scale_y, 0.0), source_height),
+        )
+
     # The 114-gray fill matches the Ultralytics letterbox convention.
     LETTERBOX_FILL = 114
 
@@ -310,15 +366,13 @@ class ImageInput(ModelInput):
         Resize preserving aspect ratio, centered on a constant-filled canvas of
         the model's input size. This matches how detection models are trained.
         '''
-        scale = min(self.width / image.width, self.height / image.height)
-        new_size = (max(1, round(image.width * scale)),
-                    max(1, round(image.height * scale)))
-        resized = image.resize(new_size, Image.BILINEAR)
+        new_width, new_height, pad_x, pad_y = \
+            self._letterbox_geometry((image.width, image.height))
+        resized = image.resize((new_width, new_height), Image.BILINEAR)
 
         background = (self.LETTERBOX_FILL,) * len(image.getbands())
         canvas = Image.new(image.mode, (self.width, self.height), background)
-        canvas.paste(resized, ((self.width - new_size[0]) // 2,
-                               (self.height - new_size[1]) // 2))
+        canvas.paste(resized, (pad_x, pad_y))
         return canvas
 
     def process(self, value: Union[Image.Image, List[Image.Image]]) \

@@ -169,6 +169,57 @@ def test_plain_resize_stretches():
     assert array.min() == 255  # no padding anywhere
 
 
+def test_source_mapping_round_trips_a_letterboxed_box():
+    '''Detections come back in input space; check we can undo the letterbox.'''
+    model, _ = make_model('yolov8n')
+    image_input = triton_api.ImageInput(layout='NCHW', letterbox=True)
+    model.images = image_input
+
+    source = (810, 1080)  # bus.jpg: portrait into a square model
+    scale_x, scale_y, pad_x, pad_y = image_input.source_mapping(source)
+    assert scale_x == scale_y                      # aspect preserved
+    assert pad_y == 0 and pad_x > 0                # padded left/right only
+
+    # A box covering the whole source maps to the whole content band and back.
+    box = (pad_x, pad_y, 640 - pad_x, 640 - pad_y)
+    x1, y1, x2, y2 = image_input.to_source_box(box, source)
+    assert x1 == pytest.approx(0, abs=1)
+    assert y1 == pytest.approx(0, abs=1)
+    assert x2 == pytest.approx(810, abs=1)
+    assert y2 == pytest.approx(1080, abs=1)
+
+
+def test_source_mapping_without_letterbox_uses_two_scales():
+    model, _ = make_model('yolov8n')
+    image_input = triton_api.ImageInput(layout='NCHW')  # stretch
+    model.images = image_input
+
+    scale_x, scale_y, pad_x, pad_y = image_input.source_mapping((1280, 640))
+    assert (pad_x, pad_y) == (0.0, 0.0)
+    assert scale_x == pytest.approx(0.5)   # 640/1280
+    assert scale_y == pytest.approx(1.0)   # 640/640
+
+
+def test_bus_detections_map_back_onto_the_original_photo():
+    model, _ = make_model('yolov8n', response='bus')
+    image_input = triton_api.ImageInput(
+        scaling=triton_api.ScalingMode.NORM, layout='NCHW', letterbox=True)
+    model.images = image_input
+    model.output0 = triton_api.DetectionOutput(confidence=0.25,
+                                               labels=COCO_CLASSES)
+
+    image = Image.open(BUS_JPG)
+    detections = model.infer(image).output0
+    bus = next(d for d in detections if d.class_name == 'bus')
+
+    x1, y1, x2, y2 = image_input.to_source_box((bus.x1, bus.y1, bus.x2, bus.y2),
+                                               image.size)
+    # Back in the photo's own 810x1080 pixels, and still a big bus-shaped box.
+    assert 0 <= x1 < x2 <= 810
+    assert 0 <= y1 < y2 <= 1080
+    assert (x2 - x1) > 400 and (y2 - y1) > 300
+
+
 def test_scaling_rejects_integer_input_tensors():
     '''A scaling mode bound to an integer tensor must fail at bind time.'''
     client = FakeInferenceServerClient('mnist')
