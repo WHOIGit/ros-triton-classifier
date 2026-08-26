@@ -85,6 +85,20 @@ class Classification(NamedTuple):
     class_name: str
 
 
+class Detection(NamedTuple):
+    '''
+    A single detected object: its class, confidence, and bounding box in
+    corner form, in pixels relative to the model's input size.
+    '''
+    score: float
+    class_id: int
+    class_name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
 class InferenceResult:
     '''
     Holds the results of an inference call.
@@ -149,11 +163,19 @@ class TensorInput(ModelInput):
 
 
 class ImageInput(ModelInput):
+    # `letterbox` is keyword-only so the pre-existing positional order
+    # (scaling, layout, size) stays stable for callers.
     def __init__(self, scaling: ScalingMode = ScalingMode.NONE,
                  layout: str = None,  # type: ignore[assignment]
-                 size: tuple = None):  # type: ignore[assignment]
+                 size: tuple = None,  # type: ignore[assignment]
+                 *, letterbox: bool = False):
         super().__init__()
         self.scaling = scaling
+        # Preserve aspect ratio by scaling to fit and padding the remainder,
+        # instead of stretching the image to the model's exact input size.
+        # Detection models (YOLO and friends) are trained this way, and feeding
+        # them a stretched image silently shifts every predicted box.
+        self.letterbox = letterbox
         # Channel layout, 'NCHW' or 'NHWC'. If None it is taken from the model
         # config's `format` field; pass it explicitly for models whose config
         # does not declare a format (common for ONNX detectors, where `format`
@@ -254,7 +276,10 @@ class ImageInput(ModelInput):
 
         # Scale the image down to size. Bilinear scaling is fine:
         # https://medium.com/neuronio/how-to-deal-with-image-resizing-in-deep-learning-e5177fad7d89
-        image = image.resize((self.width, self.height), Image.BILINEAR)
+        if self.letterbox:
+            image = self._letterbox(image)
+        else:
+            image = image.resize((self.width, self.height), Image.BILINEAR)
 
         # Convert the image to an ndarray, casting straight into the model's
         # dtype (resolved once at bind time) in a single pass.
@@ -274,8 +299,27 @@ class ImageInput(ModelInput):
             array -= 1
         else:
             raise NotImplementedError('Scaling mode is not implemented yet')
-        
+
         return array
+
+    # The 114-gray fill matches the Ultralytics letterbox convention.
+    LETTERBOX_FILL = 114
+
+    def _letterbox(self, image: Image.Image) -> Image.Image:
+        '''
+        Resize preserving aspect ratio, centered on a constant-filled canvas of
+        the model's input size. This matches how detection models are trained.
+        '''
+        scale = min(self.width / image.width, self.height / image.height)
+        new_size = (max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)))
+        resized = image.resize(new_size, Image.BILINEAR)
+
+        background = (self.LETTERBOX_FILL,) * len(image.getbands())
+        canvas = Image.new(image.mode, (self.width, self.height), background)
+        canvas.paste(resized, ((self.width - new_size[0]) // 2,
+                               (self.height - new_size[1]) // 2))
+        return canvas
 
     def process(self, value: Union[Image.Image, List[Image.Image]]) \
             -> np.ndarray:
@@ -405,6 +449,176 @@ class ClassificationOutput(ModelOutput):
             return [self._parse_classification(b) for b in value]
         else:
             raise ValueError('Expected only 1 or 2 dimensions')
+
+
+class DetectionOutput(ModelOutput):
+    '''
+    Decodes the raw output of a YOLO-style detection head into Detection
+    objects: it splits boxes from class scores, drops low-confidence anchors,
+    and applies per-class non-maximum suppression.
+
+    Expects a tensor shaped (4 + num_classes, num_anchors) -- optionally with a
+    leading batch axis -- where the first four rows are the box center x, center
+    y, width, and height in input-image pixels, as exported by Ultralytics
+    YOLOv8/v11. YOLOv5/v7-style exports that carry an extra objectness row
+    (4 + 1 + num_classes) are NOT understood; pass `labels` so the class count
+    can be checked, which turns that silent mis-decode into an error and also
+    resolves the tensor orientation authoritatively. Box coordinates are
+    relative to the model's input size; if the image was letterboxed, map them
+    back yourself using the same scale/padding.
+    '''
+
+    # Upper bound on candidates entering NMS, like Ultralytics' max_det: keeps
+    # the greedy loop bounded on cluttered frames.
+    MAX_CANDIDATES = 300
+
+    def __init__(self, confidence: float = 0.25, iou: float = 0.45,
+                 labels: List[str] = None):  # type: ignore[assignment]
+        super().__init__()
+        self.confidence = confidence
+        self.iou = iou
+        self.labels = labels
+
+    def _class_name(self, class_id: int) -> str:
+        if self.labels is not None and 0 <= class_id < len(self.labels):
+            return self.labels[class_id]
+        return str(class_id)
+
+    @staticmethod
+    def _nms(boxes: np.ndarray, scores: np.ndarray, iou: float) -> List[int]:
+        '''Greedy non-maximum suppression over xyxy boxes; returns kept indices.'''
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+        order = np.argsort(scores)[::-1]
+
+        keep = []
+        while order.size > 0:
+            best = order[0]
+            keep.append(int(best))
+            rest = order[1:]
+
+            # Intersection of the best box with every remaining box
+            ix1 = np.maximum(x1[best], x1[rest])
+            iy1 = np.maximum(y1[best], y1[rest])
+            ix2 = np.minimum(x2[best], x2[rest])
+            iy2 = np.minimum(y2[best], y2[rest])
+            overlap = (np.clip(ix2 - ix1, 0, None) *
+                       np.clip(iy2 - iy1, 0, None))
+
+            union = areas[best] + areas[rest] - overlap
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = np.where(union > 0, overlap / union, 0)
+            order = rest[ratio <= iou]
+
+        return keep
+
+    def _oriented(self, predictions: np.ndarray) -> np.ndarray:
+        '''
+        Return the output as (4 + num_classes, num_anchors). Exporters disagree
+        about the axis order; with `labels` the class count identifies the
+        right axis authoritatively, otherwise fall back to the heuristic that
+        anchors vastly outnumber the 4+nc rows.
+        '''
+        r, c = predictions.shape
+
+        if self.labels is not None:
+            rows = 4 + len(self.labels)
+            if (r == rows) != (c == rows):
+                return predictions if r == rows else predictions.T
+            if r != rows and c != rows:
+                raise ValueError(
+                    f'Neither axis of the {predictions.shape} output matches '
+                    f'4 + {len(self.labels)} labels; a YOLOv5/v7-style export '
+                    'with an objectness row (4+1+nc) is not supported')
+            # Both axes match (square): fall through to the shape heuristic,
+            # which cannot decide either.
+
+        if r == c:
+            raise ValueError(
+                f'Cannot infer the orientation of a square '
+                f'{predictions.shape} detection output; pass labels= so the '
+                'class count disambiguates it')
+        return predictions.T if r > c else predictions
+
+    def _process_one(self, predictions: np.ndarray) -> List[Detection]:
+        predictions = self._oriented(predictions)
+        if predictions.shape[0] <= 4:
+            raise ValueError(
+                f'Expected a (4 + num_classes, num_anchors) tensor, got '
+                f'{predictions.shape}: a box-only output has no class scores')
+
+        boxes, scores = predictions[:4].T, predictions[4:]
+
+        # Reduce over the class axis first and filter before the (expensive)
+        # argmax, which then only runs over the surviving anchors.
+        confidences = scores.max(axis=0)
+        selected = np.flatnonzero(confidences >= self.confidence)
+        if selected.size > self.MAX_CANDIDATES:
+            top = np.argpartition(confidences[selected],
+                                  -self.MAX_CANDIDATES)[-self.MAX_CANDIDATES:]
+            selected = selected[top]
+
+        boxes = boxes[selected]
+        confidences = confidences[selected]
+        class_ids = np.argmax(scores[:, selected], axis=0)
+
+        if selected.size == 0:
+            return []
+
+        # Convert center-form xywh to corner-form xyxy for NMS, and clip to the
+        # input bounds -- the head can predict boxes that run off the edge. The
+        # bounds come from whichever input is a bound ImageInput; when nothing
+        # exposes a size (e.g. a TensorInput fed preprocessed arrays) we cannot
+        # clip, and say so once rather than silently skipping.
+        centers, half = boxes[:, :2], boxes[:, 2:4] * 0.5
+        corners = np.concatenate([centers - half, centers + half], axis=1)
+        image_input = next(
+            (obj for m in self.model.metadata.inputs
+             if isinstance(obj := getattr(self.model, m.name), ImageInput)),
+            None)
+        if image_input is not None:
+            np.clip(corners[:, 0::2], 0, image_input.width,
+                    out=corners[:, 0::2])
+            np.clip(corners[:, 1::2], 0, image_input.height,
+                    out=corners[:, 1::2])
+        else:
+            warnings.warn('No ImageInput is bound, so detection boxes are not '
+                          'clipped to the input bounds', stacklevel=2)
+
+        # Per-class suppression via the offset trick: shift each class's boxes
+        # into a disjoint coordinate region so a single NMS pass can never
+        # suppress across classes. Any offset wider than the coordinate span
+        # works. _nms returns indices best-first, so the result is sorted.
+        offset = float(corners.max() - min(corners.min(), 0.0)) + 1.0
+        shifted = corners + (class_ids * offset)[:, None]
+
+        detections = []
+        for index in self._nms(shifted, confidences, self.iou):
+            x1, y1, x2, y2 = corners[index]
+            class_id = int(class_ids[index])
+            detections.append(Detection(
+                score=float(confidences[index]),
+                class_id=class_id,
+                class_name=self._class_name(class_id),
+                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+            ))
+        return detections
+
+    def process(self, value: np.ndarray) \
+            -> Union[List[List[Detection]], List[Detection]]:
+
+        # Only a batching model's leading axis is a batch; for a non-batching
+        # model a leading 1 belongs to the model's own output shape.
+        if self.model.can_batch:
+            if value.ndim != 3:
+                raise ValueError('Expected 3 dimensions for a batched output')
+            return [self._process_one(a) for a in value]
+
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        if value.ndim != 2:
+            raise ValueError('Expected a 2-dimensional detection output')
+        return self._process_one(value)
 
 
 class Model:
@@ -596,25 +810,42 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('-m', '--model-name', required=True)
     parser.add_argument('-x', '--model-version', default='')
-    parser.add_argument('-c', '--classes', type=int, default=3,
-                        help='classes to request (classification mode)')
-    # ScalingMode.VGG exists in the enum but has no implementation yet, so it
-    # is deliberately not offered here.
+    parser.add_argument('-b', '--batch-size', type=int, default=1,
+                        help='images to submit per inference request; the '
+                             "model's max_batch_size is the upper limit")
+    # VGG is deliberately absent: ScalingMode.VGG has no implementation, and
+    # offering it here only defers the failure to inference time.
     parser.add_argument('-t', '--image-transform',
                         choices=['NONE', 'NORM', 'INCEPTION'],
                         default='NONE')
     parser.add_argument('-l', '--layout', choices=['NCHW', 'NHWC'], default=None,
                         help="channel layout when the model config omits `format`")
+    parser.add_argument('--letterbox', action='store_true',
+                        help='preserve aspect ratio by padding instead of '
+                             'stretching (detection models expect this)')
     parser.add_argument('-s', '--size', type=int, nargs=2, default=None,
                         metavar=('WIDTH', 'HEIGHT'),
                         help='input size for models that declare dynamic '
                              'spatial dimensions')
-    parser.add_argument('--raw', action='store_true',
-                        help='return the raw output tensor instead of parsing '
-                             'classifications (e.g. for detection models)')
     parser.add_argument('-u', '--url', default='localhost:8001')
+
+    # How to interpret the output tensor. These are mutually exclusive so that
+    # e.g. `-c 5 --raw` is rejected rather than silently ignoring -c.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('-c', '--classes', type=int, default=None,
+                      help='parse the top N classifications (the default, N=3)')
+    mode.add_argument('--detect', action='store_true',
+                      help='decode YOLO-style detections (boxes + NMS)')
+    mode.add_argument('--raw', action='store_true',
+                      help='return the raw output tensor without parsing')
+
     parser.add_argument('images', nargs='+')
     args = parser.parse_args()
+
+    # Detection models are trained on letterboxed input; a stretched image
+    # silently shifts every predicted box, so --detect implies --letterbox.
+    if args.detect:
+        args.letterbox = True
 
     model = initialize_model(args.url, args.model_name, args.verbose,
                              args.model_version)
@@ -626,17 +857,31 @@ def main():
 
     setattr(model, in_name, ImageInput(
         scaling=ScalingMode[args.image_transform], layout=args.layout,
+        letterbox=args.letterbox,
         size=tuple(args.size) if args.size else None))
     if args.raw:
         setattr(model, out_name, TensorOutput())
+    elif args.detect:
+        setattr(model, out_name, DetectionOutput())
     else:
-        setattr(model, out_name, ClassificationOutput(classes=args.classes))
+        setattr(model, out_name, ClassificationOutput(
+            classes=args.classes if args.classes is not None else 3))
 
     images = [Image.open(path) for path in args.images]
 
+    # Submit in batches so a batch-capable model can amortize the round trip.
+    batch_size = max(1, args.batch_size)
+    if batch_size > 1 and not model.can_batch:
+        parser.error(f'model {model.name} does not accept batched input')
+    if model.can_batch:
+        batch_size = min(batch_size, model.max_batch_size)
+
     start = time.perf_counter()
-    for image in images:
-        result = model.infer(image)
+    for offset in range(0, len(images), batch_size):
+        batch = images[offset:offset + batch_size]
+
+        # A batching model always wants a list, even a single-element one.
+        result = model.infer(batch if model.can_batch else batch[0])
         value = getattr(result, out_name)
         if args.raw:
             arr = np.asarray(value)
