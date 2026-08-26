@@ -1,82 +1,154 @@
-# NVIDIA does not publish a Triton container image for Jetson devices.
-# https://github.com/triton-inference-server/server/issues/4781
+# Triton Inference Server for Jetson / JetPack 5.1.2+ (L4T r35.4.1 or newer).
 #
-# This unofficial container image unpacks the Triton for Jetson tarball onto a 
-# L4T base image along with dependencies documented here:
-# https://github.com/triton-inference-server/server/blob/main/docs/user_guide/jetson.md
+# NVIDIA does not publish a Triton *container* for JetPack 5 (the "-igpu" NGC
+# images target JetPack 6.0+); for JetPack 5 they only ship a tarball:
+#   https://github.com/triton-inference-server/server/issues/4781
+#   https://github.com/triton-inference-server/server/blob/main/docs/user_guide/jetson.md
+# So this image unpacks the JetPack 5 Triton tarball onto an l4t-jetpack base
+# and adds the dependencies the tarball needs that the base lacks.
 #
-# Example usage:
+# Tested target: Pyxis backseat, L4T r35.6.2 (JetPack 5.1.x). Note that this is
+# a "container-first" flash: the CUDA/cuDNN/TensorRT toolkit is NOT installed on
+# the host rootfs, so the nvidia runtime's CSV mount only supplies the Tegra
+# driver (libcuda). The toolkit must therefore come from the image, which is why
+# we base on l4t-jetpack (self-contained CUDA/cuDNN/TensorRT) rather than
+# l4t-base + `csv-mounts=all`.
 #
-#   docker build -t tritonserver:22.02-pyt-python-py3 -f Dockerfile.jetson .
-#   docker run --rm --name triton --runtime nvidia \
-#     --volume /usr/local/share/triton/models:/models \
-#     --publish 8000:8000/tcp \
-#     --publish 8001:8001/tcp \
-#     --publish 8002:8002/tcp \
-#     tritonserver:22.02-pyt-python-py3 \
-#     tritonserver --model-repository /models
-#
-# There are other base images (l4t-ml, l4t-pytorch, etc.) that might be better.
+# Build and run commands: see "Server (Jetson)" in the top-level README.md.
 
-FROM nvcr.io/nvidia/l4t-base:r32.7.1
+# Triton 2.35.0 is the newest prebuilt build for JetPack 5.1.2
+# (TensorRT 8.5.2.2, ONNX Runtime 1.15.0, Python 3.8 — all matching JP5.1.x).
+ARG TRITON_VERSION=2.35.0
+ARG JETPACK_VERSION=5.1.2
+ARG BOOST_VERSION=1.80.0
+ARG TRITON_TARBALL=tritonserver${TRITON_VERSION}-jetpack${JETPACK_VERSION}-update-2.tgz
+ARG TRITON_URL=https://github.com/triton-inference-server/server/releases/download/v${TRITON_VERSION}/${TRITON_TARBALL}
+# Optional SHA-256 pins; each download is verified only when its ARG is
+# non-empty. BOOST_SHA256 defaults to the checksum published alongside the
+# tarball (archives.boost.io .../boost_1_80_0.tar.gz.json) — update it when
+# bumping BOOST_VERSION. NVIDIA publishes no checksum for the Triton tarball,
+# so TRITON_SHA256 defaults to empty (unverified).
+ARG TRITON_SHA256=""
+ARG BOOST_SHA256=4b2136f98bdd1f5857f1c3dea9ac2018effe65286cf251534b6ae20cc45e1847
 
-# Update CA certificates so that we don't get TLS issues downloading from GitHub
-RUN apt update \
- && apt install -y \
+# r35.4.1 is the last l4t-jetpack tag NVIDIA published (JetPack 5.1.2:
+# CUDA 11.4, cuDNN 8.6, TensorRT 8.5.2.2). Its userspace runs on the host's
+# r35.6.2 driver (forward-compatible within JP5.1.x), and its TensorRT matches
+# the Triton tarball exactly. Both stages use it so the Boost build sees the
+# same toolchain/glibc as the runtime image.
+
+# --- Stage 1: build Boost ---------------------------------------------------
+# The Triton Jetson binary links Boost 1.80 (libboost_filesystem.so.1.80.0),
+# newer than anything in the Ubuntu 20.04 archive (1.71), so build the needed
+# libraries from source (the library list lives in the bootstrap.sh line).
+# Building in a separate stage keeps the toolchain and the ~100MB of Boost
+# headers out of the runtime image entirely.
+FROM nvcr.io/nvidia/l4t-jetpack:r35.4.1 AS boost-builder
+
+ARG BOOST_VERSION
+ARG BOOST_SHA256
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
         ca-certificates \
+        wget \
  && rm -rf /var/lib/apt/lists/*
 
-# Uncomment if you have pre-downloaded the Triton sources
-# COPY tritonserver.tgz .
+# Boost's tarball/directory name uses underscores (e.g. boost_1_80_0).
+RUN BOOST_DIR="boost_$(echo "${BOOST_VERSION}" | tr . _)" \
+ && wget -O /tmp/boost.tar.gz \
+        "https://archives.boost.io/release/${BOOST_VERSION}/source/${BOOST_DIR}.tar.gz" \
+ && { [ -z "${BOOST_SHA256}" ] \
+      || echo "${BOOST_SHA256}  /tmp/boost.tar.gz" | sha256sum -c -; } \
+ && tar xf /tmp/boost.tar.gz -C /tmp \
+ && cd "/tmp/${BOOST_DIR}" \
+ && ./bootstrap.sh --with-libraries=filesystem,system \
+ && ./b2 -j"$(nproc)" install
 
-# Download and unpack the Triton sources
-RUN ([ -f tritonserver.tgz ] || wget -O tritonserver.tgz \
-        https://github.com/triton-inference-server/server/releases/download/v2.19.0/tritonserver2.19.0-jetpack4.6.1.tgz) \
- && mkdir /opt/tritonserver \
- && tar xf tritonserver*.tgz -C /opt/tritonserver --strip-components 1 \
- && rm -f tritonserver*.tgz
+# --- Stage 2: runtime image -------------------------------------------------
+FROM nvcr.io/nvidia/l4t-jetpack:r35.4.1
 
-# NOTE:
-# The following instructions are based on docs/jetson.md, and based on the work
-# of @CoderHam to identify only the runtime dependencies.
-RUN apt update \
- && apt install -y \
-        libarchive-dev \
+ARG TRITON_TARBALL
+ARG TRITON_URL
+ARG TRITON_SHA256
+ARG BOOST_VERSION
+
+# Runtime libraries the Triton core + backends link against on Ubuntu 20.04
+# (focal), plus wget/ca-certificates for the tarball download below.
+# CUDA/cuDNN/TensorRT come from the base image, EXCEPT NVTX
+# (libnvToolsExt.so.1): NVIDIA's r35.4.1 l4t-jetpack image ships
+# CUDA/cuDNN/TensorRT but omits the NVTX package, and this Jetson has no CUDA on
+# the host rootfs for the nvidia runtime's CSV mount to supply it — so pull it
+# from the CUDA apt repo the base image already has configured.
+# libpython3.8 + python3-numpy serve the Python backend: the prebuilt
+# triton_python_backend_stub links libpython3.8.so.1.0 and needs numpy.
+# Backends: this image supports TensorRT, ONNX Runtime, and Python only — the
+# old image's PyTorch/libtorch provisioning was intentionally dropped, so
+# TorchScript models will not load.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cuda-nvtx-11-4 \
+        libarchive13 \
         libb64-0d \
+        libnuma1 \
         libomp5 \
-        libomp-dev \
-        libopenblas-dev \
-        libre2-4 \
+        libopenblas0 \
+        libpython3.8 \
+        libre2-5 \
         libssl1.1 \
         python3 \
-        python3-dev \
-        python3-pip \
-        rapidjson-dev \
+        python3-numpy \
+        wget \
         zlib1g \
  && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip first, because otherwise we can't install aiohttp
-RUN python3 -m pip install --upgrade pip \
- && python3 -m pip install --upgrade \
-        aiohttp \
-        expecttest \
-        hypothesis \
-        ninja \
-        protobuf \
-        pyyaml \
-        scipy \
-        typing_extensions \
-        xmlrunner \
- && python3 -m pip install --upgrade \
-        https://developer.download.nvidia.com/compute/redist/jp/v461/pytorch/torch-1.11.0a0+17540c5+nv22.01-cp36-cp36m-linux_aarch64.whl
+# Pre-place ${TRITON_TARBALL} in the build context (triton/) to skip the
+# download. The wildcard lets this COPY succeed when the tarball is absent;
+# Dockerfile.jetson itself guarantees at least one match.
+COPY Dockerfile.jetson ${TRITON_TARBALL}* /ctx/
 
-# You cannot append to an environment variable in a Dockerfile, so we need to
-# set the whole value, which hardcodes our CUDA version.
-ENV PATH /opt/tritonserver/bin:/usr/local/cuda-10.2/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Use the pre-placed tarball if present, else download; verify when a checksum
+# was given. The extraction is layout-agnostic (a --strip-components 1 carried
+# over from the JetPack 4 tarball may not match JP5): if the tarball has
+# exactly one top-level directory, move its contents; else move everything.
+RUN if [ -f "/ctx/${TRITON_TARBALL}" ]; then \
+        tarball="/ctx/${TRITON_TARBALL}"; \
+    else \
+        tarball="/tmp/${TRITON_TARBALL}"; \
+        wget -O "$tarball" "${TRITON_URL}"; \
+    fi \
+ && { [ -z "${TRITON_SHA256}" ] \
+      || echo "${TRITON_SHA256}  $tarball" | sha256sum -c -; } \
+ && mkdir -p /tmp/triton-unpack /opt/tritonserver \
+ && tar xf "$tarball" -C /tmp/triton-unpack \
+ && set -- /tmp/triton-unpack/* \
+ && if [ "$#" -eq 1 ] && [ -d "$1" ]; then \
+        mv "$1"/* /opt/tritonserver/; \
+    else \
+        mv "$@" /opt/tritonserver/; \
+    fi \
+ && rm -rf /tmp/triton-unpack "/tmp/${TRITON_TARBALL}" /ctx
 
-# As of libnvidia-container v0.11.0+jetpack, the CUDA libraries from the host
-# are not exposed to the container unless we set this environment variable.
-ENV NVIDIA_REQUIRE_JETPACK csv-mounts=all
+# Only the two Boost runtime libraries — no headers, no toolchain.
+COPY --from=boost-builder \
+        /usr/local/lib/libboost_filesystem.so.${BOOST_VERSION} \
+        /usr/local/lib/libboost_system.so.${BOOST_VERSION} \
+        /usr/local/lib/
+RUN ldconfig
+
+ENV PATH=/opt/tritonserver/bin:${PATH}
+
+# Backend companion libraries ship beside the backend .so without RPATH.
+ENV LD_LIBRARY_PATH=/opt/tritonserver/lib:/opt/tritonserver/backends/onnxruntime
+
+# GPU access on Jetson via `--runtime nvidia` (mounts the host Tegra driver).
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # HTTP API, gRPC API, and Prometheus metrics, respectively
 EXPOSE 8000 8001 8002
+
+# Default: serve a model repository bind-mounted at /models.
+CMD ["tritonserver", "--model-repository=/models"]
