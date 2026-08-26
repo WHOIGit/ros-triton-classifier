@@ -34,9 +34,13 @@ parameter name. Consumers read `VisionInfo` once and then look the map up:
 
 ```python
 info = rospy.wait_for_message('<image_topic>/vision_info', VisionInfo)
-labels = rospy.get_param(info.database_location)   # {'0': 'amphipod', ...}
-name = labels[str(detection.results[0].id)]
+if info.database_location:      # empty when the node has no labels configured
+    labels = rospy.get_param(info.database_location)   # {'0': 'amphipod', ...}
+    name = labels[str(detection.results[0].id)]
 ```
+
+`database_version` changes whenever the model or its labels change, so a
+consumer can cache the map and re-read it only when the version moves.
 
 This indirection is what `VisionInfo` exists for — its own definition
 recommends storing the database "as an XML string on the ROS parameter server"
@@ -48,8 +52,9 @@ optional; without them the node publishes numeric ids and logs a warning.
 ### Other parameters
 
 `~triton_server_url`, `~classifier_model`, `~layout` (`NCHW`/`NHWC`, needed when
-the model config declares no `format`), `~classes` (classification),
-`~confidence_threshold` and `~iou_threshold` (detection).
+the model config declares no `format`), `~input_size` (`[width, height]`, needed
+when the model declares dynamic spatial dimensions), `~classes`
+(classification), `~confidence_threshold` and `~iou_threshold` (detection).
 
 
 ## Installation
