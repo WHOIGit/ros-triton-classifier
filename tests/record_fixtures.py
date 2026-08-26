@@ -13,15 +13,21 @@ Re-record only when the models or the Triton version change.
 '''
 
 import argparse
-import json
 import os
+import sys
 
 import numpy as np
 import tritonclient.grpc
 import tritonclient.utils
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIXTURES = os.path.join(HERE, 'fixtures')
+sys.path.insert(0, os.path.join(HERE, '..', 'src'))
+sys.path.insert(0, HERE)
+
+import triton_api  # noqa: E402
+# The fixture path/compression convention and index schema live in
+# fake_triton; writing through it keeps recorder and replayer in lockstep.
+from fake_triton import FIXTURES, write_fixture, write_index  # noqa: E402
 
 # Models to record, and the inputs to record responses for. Inputs are
 # described as plain shapes/fills so this script needs no image assets.
@@ -49,17 +55,24 @@ RECORDINGS = [
 ]
 
 
-def make_input(shape, dtype, request):
+def make_input(shape, dtype, request, model_obj, input_name):
     '''
     Build the input array for a recording.
 
     Either a deterministic synthetic pattern (a constant fill or a ramp), or a
-    real image letterboxed and normalized exactly the way ImageInput would, so
-    the recorded response corresponds to an input the tests can rebuild.
+    real image preprocessed by triton_api.ImageInput itself -- the very code
+    the tests exercise -- so the recorded response corresponds by construction
+    to an input the tests can rebuild.
     '''
     if request.get('image'):
-        return letterbox_image(os.path.join(HERE, request['image']),
-                               shape, dtype)
+        from PIL import Image
+
+        image_input = triton_api.ImageInput(
+            scaling=triton_api.ScalingMode.NORM, layout='NCHW',
+            letterbox=True)
+        setattr(model_obj, input_name, image_input)
+        return image_input.process(Image.open(os.path.join(HERE,
+                                                           request['image'])))
 
     size = int(np.prod(shape))
     if request.get('fill') is None:
@@ -67,31 +80,6 @@ def make_input(shape, dtype, request):
     else:
         data = np.full(size, request['fill'], dtype=np.float64)
     return data.reshape(shape).astype(dtype)
-
-
-def letterbox_image(path, shape, dtype):
-    '''Load an image and letterbox it into an NCHW tensor of `shape`, /255.'''
-    from PIL import Image
-
-    channels, height, width = shape[-3], shape[-2], shape[-1]
-    image = Image.open(path).convert('RGB' if channels == 3 else 'L')
-
-    scale = min(width / image.width, height / image.height)
-    new_size = (max(1, round(image.width * scale)),
-                max(1, round(image.height * scale)))
-    resized = image.resize(new_size, Image.BILINEAR)
-
-    fill = 114
-    background = fill if image.mode == 'L' else (fill,) * channels
-    canvas = Image.new(image.mode, (width, height), background)
-    canvas.paste(resized, ((width - new_size[0]) // 2,
-                           (height - new_size[1]) // 2))
-
-    array = np.array(canvas).astype(np.float32) / 255.0
-    if array.ndim == 2:
-        array = array[:, :, np.newaxis]
-    array = np.transpose(array, (2, 0, 1))          # HWC -> CHW
-    return array.reshape(shape).astype(dtype)
 
 
 def main():
@@ -103,16 +91,16 @@ def main():
 
     for entry in RECORDINGS:
         model = entry['model']
-        out_dir = os.path.join(FIXTURES, model)
-        os.makedirs(out_dir, exist_ok=True)
 
         config = triton.get_model_config(model_name=model, as_json=False)
         metadata = triton.get_model_metadata(model_name=model, as_json=False)
 
-        with open(os.path.join(out_dir, 'config.pb'), 'wb') as f:
-            f.write(config.SerializeToString())
-        with open(os.path.join(out_dir, 'metadata.pb'), 'wb') as f:
-            f.write(metadata.SerializeToString())
+        write_fixture(model, 'config.pb', config.SerializeToString())
+        write_fixture(model, 'metadata.pb', metadata.SerializeToString())
+
+        # A live Model, so image inputs can be preprocessed by the real
+        # ImageInput pipeline rather than a re-implementation of it here.
+        model_obj = triton_api.Model(triton, model)
 
         meta_in = metadata.inputs[0]
         shape = [d if d > 0 else 1 for d in meta_in.shape]
@@ -124,7 +112,7 @@ def main():
                  'datatype': meta_in.datatype, 'requests': []}
 
         for request in entry['requests']:
-            array = make_input(shape, dtype, request)
+            array = make_input(shape, dtype, request, model_obj, meta_in.name)
 
             infer_input = tritonclient.grpc.InferInput(
                 meta_in.name, list(array.shape), meta_in.datatype)
@@ -142,8 +130,8 @@ def main():
             # result.get_response() is the ModelInferResponse protobuf; storing
             # it verbatim is what makes the replay faithful.
             name = request['name']
-            with open(os.path.join(out_dir, f'response_{name}.pb'), 'wb') as f:
-                f.write(result.get_response().SerializeToString())
+            write_fixture(model, f'response_{name}.pb',
+                          result.get_response().SerializeToString())
 
             index['requests'].append({
                 'name': name,
@@ -153,8 +141,7 @@ def main():
             })
             print(f'  recorded {name} (class_count={request["class_count"]})')
 
-        with open(os.path.join(out_dir, 'index.json'), 'w') as f:
-            json.dump(index, f, indent=2, sort_keys=True)
+        write_index(model, index)
 
     print('fixtures written to', FIXTURES)
 
