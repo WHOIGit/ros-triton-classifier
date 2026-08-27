@@ -93,7 +93,9 @@ def publish_class_labels(model_name, labels):
     rospy.set_param(key, {str(i): name for i, name in enumerate(labels)})
 
     # The digest doubles as a version, so consumers can notice label changes.
-    return key, int(digest, 16)
+    # Masked to 31 bits: the message field is int32 and a full 8-hex-digit
+    # digest overflows it half the time.
+    return key, int(digest, 16) & 0x7FFFFFFF
 
 
 def on_image(model, output_name, publisher, builder, image_msg):
