@@ -264,10 +264,16 @@ def main():
     # Subscribe to the raw image data. image_transport publishes the raw
     # sensor_msgs/Image on the base topic itself -- only the other transports
     # get "<base topic>/<transport name>" subtopics -- so do not append /raw.
+    # The rospy defaults are an unbounded queue and a 64 KiB receive buffer,
+    # which is smaller than a single Image from a megapixel camera. Bound the
+    # queue so overload drops frames instead of growing memory, and size the
+    # buffer for several frames so the queue, not the socket, governs.
     rospy.Subscriber(
         image_topic,
         Image,
-        functools.partial(on_image, model, output_name, publisher, builder)
+        functools.partial(on_image, model, output_name, publisher, builder),
+        queue_size=rospy.get_param('~queue_size', 1),
+        buff_size=rospy.get_param('~buff_size', 2 ** 24),
     )
 
     rospy.spin()
