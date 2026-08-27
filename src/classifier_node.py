@@ -45,6 +45,8 @@ from triton_api import (
     initialize_model,
 )
 
+_BRIDGE = CvBridge()
+
 
 def load_class_labels():
     '''
@@ -91,14 +93,16 @@ def publish_class_labels(model_name, labels):
     rospy.set_param(key, {str(i): name for i, name in enumerate(labels)})
 
     # The digest doubles as a version, so consumers can notice label changes.
-    return key, int(digest, 16)
+    # Masked to 31 bits: the message field is int32 and a full 8-hex-digit
+    # digest overflows it half the time.
+    return key, int(digest, 16) & 0x7FFFFFFF
 
 
 def on_image(model, output_name, publisher, builder, image_msg):
-    # Use the cv_bridge to convert to an OpenCV image object
-    img = CvBridge().imgmsg_to_cv2(image_msg)
-    # Convert the OpenCV image to a PIL image
-    pil_image = PilImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    # cv_bridge converts whatever encoding arrives (mono8, bgr8, ...) to the
+    # rgb8 the model pipeline expects.
+    img = _BRIDGE.imgmsg_to_cv2(image_msg, desired_encoding='rgb8')
+    pil_image = PilImage.fromarray(img)
 
     try:
         result = model.infer(pil_image)
@@ -262,10 +266,16 @@ def main():
     # Subscribe to the raw image data. image_transport publishes the raw
     # sensor_msgs/Image on the base topic itself -- only the other transports
     # get "<base topic>/<transport name>" subtopics -- so do not append /raw.
+    # The rospy defaults are an unbounded queue and a 64 KiB receive buffer,
+    # which is smaller than a single Image from a megapixel camera. Bound the
+    # queue so overload drops frames instead of growing memory, and size the
+    # buffer for several frames so the queue, not the socket, governs.
     rospy.Subscriber(
         image_topic,
         Image,
-        functools.partial(on_image, model, output_name, publisher, builder)
+        functools.partial(on_image, model, output_name, publisher, builder),
+        queue_size=rospy.get_param('~queue_size', 1),
+        buff_size=rospy.get_param('~buff_size', 2 ** 24),
     )
 
     rospy.spin()
